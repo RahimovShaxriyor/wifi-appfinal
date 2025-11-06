@@ -729,7 +729,7 @@ class ModernProgressBar extends JProgressBar {
         setBorder(BorderFactory.createEmptyBorder(2, 2, 2, 2));
     }
 }
-
+//
 class ModernSectionLabel extends JLabel {
     public ModernSectionLabel(String text) {
         super(text);
