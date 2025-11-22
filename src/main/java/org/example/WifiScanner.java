@@ -4,352 +4,85 @@ import javax.swing.*;
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class WifiScanner {
-    private Consumer<String> logger;
+    private final Consumer<String> logger;
     private volatile boolean isScanning = false;
-    private SwingWorker<List<String>, String> currentWorker;
+    private SwingWorker<List<WifiNetwork>, String> currentWorker;
+    private List<WifiNetwork> lastScanResult = new ArrayList<>();
 
     public WifiScanner(Consumer<String> logger) {
         this.logger = logger;
     }
 
-    public void scanNetworks(Consumer<List<String>> callback) {
+    // === Основной метод сканирования ===
+    public void scanNetworks(Consumer<List<WifiNetwork>> callback) {
         if (isScanning) {
-            log("⚠️ Сканирование уже выполняется...");
+            log("Сканирование уже запущено...");
             return;
         }
 
         isScanning = true;
-        log("🔍 Запуск сканирования Wi-Fi сетей...");
+        log("Запуск сканирования Wi-Fi сетей...");
 
-        currentWorker = new SwingWorker<List<String>, String>() {
+        currentWorker = new SwingWorker<>() {
             private long startTime;
 
             @Override
-            protected List<String> doInBackground() {
+            protected List<WifiNetwork> doInBackground() {
                 startTime = System.currentTimeMillis();
-                List<String> networks = new ArrayList<>();
+                List<WifiNetwork> networks = new ArrayList<>();
 
                 try {
-                    // Способ 1: Используем nmcli (Linux)
                     if (isLinux()) {
                         networks = scanWithNmcli();
-                    }
-                    // Способ 2: Используем netsh (Windows)
-                    else if (isWindows()) {
+                    } else if (isWindows()) {
                         networks = scanWithNetsh();
-                    }
-                    // Способ 3: Используем airport (macOS)
-                    else if (isMac()) {
+                    } else if (isMac()) {
                         networks = scanWithAirport();
-                    }
-                    // Способ 4: Резервный - демо-данные
-                    else {
+                    } else {
                         networks = getDemoNetworks();
-                        publish("ℹ️ Используются демо-данные для тестирования");
+                        publish("Используются демо-данные");
                     }
-
                 } catch (Exception ex) {
-                    publish("❌ Критическая ошибка сканирования: " + ex.getMessage());
-                    networks = getDemoNetworks(); // Fallback to demo data
+                    publish("Ошибка сканирования: " + ex.getMessage());
+                    networks = getDemoNetworks();
                 }
 
+                // Сортировка: сначала сильные сигналы
+                networks.sort((a, b) -> Integer.compare(b.getSignalStrength(), a.getSignalStrength()));
                 return networks;
             }
 
             @Override
-            protected void process(List<String> chunks) {
-                for (String message : chunks) {
-                    log(message);
-                }
+            protected void process(java.util.List<String> chunks) {
+                chunks.forEach(logger::accept);
             }
 
             @Override
             protected void done() {
                 isScanning = false;
-                long scanTime = System.currentTimeMillis() - startTime;
+                long duration = System.currentTimeMillis() - startTime;
 
                 try {
-                    List<String> result = get();
+                    List<WifiNetwork> result = get();
+                    lastScanResult = result;
+
                     if (result.isEmpty()) {
-                        log("❌ Сети не обнаружены");
+                        log("Сети не найдены");
                     } else {
-                        log("✅ Сканирование завершено за " + scanTime + "мс");
-                        log("📊 Найдено сетей: " + result.size());
+                        log("Сканирование завершено за " + duration + " мс");
+                        log("Найдено сетей: " + result.size());
                     }
                     callback.accept(result);
                 } catch (Exception ex) {
-                    log("❌ Ошибка получения результатов: " + ex.getMessage());
+                    log("Ошибка получения результата: " + ex.getMessage());
                     callback.accept(getDemoNetworks());
                 }
-            }
-
-            // === МЕТОДЫ СКАНИРОВАНИЯ ДЛЯ РАЗНЫХ ОС ===
-
-            private List<String> scanWithNmcli() {
-                List<String> networks = new ArrayList<>();
-                try {
-                    ProcessBuilder pb = new ProcessBuilder("nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi");
-                    pb.redirectErrorStream(true);
-                    Process process = pb.start();
-
-                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                        String line;
-                        Set<String> seenNetworks = new LinkedHashSet<>();
-
-                        while ((line = reader.readLine()) != null && !isCancelled()) {
-                            String[] parts = line.split(":", -1);
-                            if (parts.length >= 1) {
-                                String ssid = parts[0].trim();
-
-                                // Пропускаем пустые SSID и скрытые сети
-                                if (!ssid.isEmpty() && !ssid.equals("--") && !seenNetworks.contains(ssid)) {
-                                    seenNetworks.add(ssid);
-
-                                    // Извлекаем дополнительную информацию
-                                    String signal = parts.length > 1 ? parts[1] : "0";
-                                    String security = parts.length > 2 ? parts[2] : "none";
-
-                                    String networkInfo = formatNetworkInfo(ssid, signal, security);
-                                    publish("📶 Обнаружена сеть: " + networkInfo);
-                                }
-                            }
-                        }
-
-                        boolean finished = process.waitFor(15, TimeUnit.SECONDS);
-                        if (!finished) {
-                            process.destroy();
-                            publish("⚠️ Сканирование прервано по таймауту");
-                        }
-
-                        networks.addAll(seenNetworks);
-                    }
-                } catch (Exception e) {
-                    publish("❌ Ошибка nmcli: " + e.getMessage());
-                    // Пробуем альтернативную команду
-                    networks = scanWithIwlist();
-                }
-                return networks;
-            }
-
-            private List<String> scanWithIwlist() {
-                List<String> networks = new ArrayList<>();
-                try {
-                    ProcessBuilder pb = new ProcessBuilder("iwlist", "scanning");
-                    pb.redirectErrorStream(true);
-                    Process process = pb.start();
-
-                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                        String line;
-                        String currentSsid = null;
-
-                        while ((line = reader.readLine()) != null && !isCancelled()) {
-                            line = line.trim();
-
-                            // Ищем SSID
-                            if (line.contains("ESSID:")) {
-                                String ssid = line.substring(line.indexOf("ESSID:") + 6).trim();
-                                ssid = ssid.replace("\"", "").trim();
-
-                                if (!ssid.isEmpty() && !ssid.equals("\\x00")) {
-                                    currentSsid = ssid;
-                                    if (!networks.contains(ssid)) {
-                                        networks.add(ssid);
-                                        publish("📶 Сеть: " + ssid);
-                                    }
-                                }
-                            }
-                        }
-
-                        process.waitFor(10, TimeUnit.SECONDS);
-                    }
-                } catch (Exception e) {
-                    publish("❌ Ошибка iwlist: " + e.getMessage());
-                }
-                return networks;
-            }
-
-            private List<String> scanWithNetsh() {
-                List<String> networks = new ArrayList<>();
-                try {
-                    ProcessBuilder pb = new ProcessBuilder("netsh", "wlan", "show", "networks", "mode=bssid");
-                    pb.redirectErrorStream(true);
-                    Process process = pb.start();
-
-                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                        String line;
-                        String currentSsid = null;
-                        Pattern ssidPattern = Pattern.compile("SSID \\d+ : (.+)");
-
-                        while ((line = reader.readLine()) != null && !isCancelled()) {
-                            line = line.trim();
-
-                            if (line.startsWith("SSID") && line.contains(":")) {
-                                String ssid = line.substring(line.indexOf(":") + 1).trim();
-                                if (!ssid.isEmpty() && !networks.contains(ssid)) {
-                                    networks.add(ssid);
-                                    currentSsid = ssid;
-                                    publish("📶 Сеть: " + ssid);
-                                }
-                            }
-                        }
-
-                        process.waitFor(15, TimeUnit.SECONDS);
-                    }
-                } catch (Exception e) {
-                    publish("❌ Ошибка netsh: " + e.getMessage());
-                    // Альтернативная команда для Windows
-                    networks = scanWithNetshSimple();
-                }
-                return networks;
-            }
-
-            private List<String> scanWithNetshSimple() {
-                List<String> networks = new ArrayList<>();
-                try {
-                    ProcessBuilder pb = new ProcessBuilder("netsh", "wlan", "show", "networks");
-                    pb.redirectErrorStream(true);
-                    Process process = pb.start();
-
-                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                        String line;
-                        boolean inNetworkSection = false;
-
-                        while ((line = reader.readLine()) != null && !isCancelled()) {
-                            line = line.trim();
-
-                            if (line.contains("SSID") && line.contains(":")) {
-                                String ssid = line.substring(line.indexOf(":") + 1).trim();
-                                if (!ssid.isEmpty() && !networks.contains(ssid)) {
-                                    networks.add(ssid);
-                                    publish("📶 Сеть: " + ssid);
-                                }
-                            }
-                        }
-
-                        process.waitFor(10, TimeUnit.SECONDS);
-                    }
-                } catch (Exception e) {
-                    publish("❌ Ошибка альтернативного сканирования: " + e.getMessage());
-                }
-                return networks;
-            }
-
-            private List<String> scanWithAirport() {
-                List<String> networks = new ArrayList<>();
-                try {
-                    // Пробуем разные пути к airport utility
-                    String[] airportPaths = {
-                            "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
-                            "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/A/Resources/airport",
-                            "/usr/sbin/airport"
-                    };
-
-                    Process process = null;
-                    for (String path : airportPaths) {
-                        try {
-                            ProcessBuilder pb = new ProcessBuilder(path, "-s");
-                            pb.redirectErrorStream(true);
-                            process = pb.start();
-                            break;
-                        } catch (Exception e) {
-                            continue;
-                        }
-                    }
-
-                    if (process == null) {
-                        publish("❌ Airport utility не найден");
-                        return networks;
-                    }
-
-                    try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                        String line;
-                        boolean firstLine = true;
-
-                        while ((line = reader.readLine()) != null && !isCancelled()) {
-                            if (firstLine) {
-                                firstLine = false;
-                                continue; // Пропускаем заголовок
-                            }
-
-                            if (!line.trim().isEmpty()) {
-                                // Парсим строку вида "SSID BSSID RSSI CHANNEL SECURITY"
-                                String[] parts = line.split("\\s+", 5);
-                                if (parts.length >= 1) {
-                                    String ssid = parts[0].trim();
-                                    if (!ssid.isEmpty() && !networks.contains(ssid)) {
-                                        networks.add(ssid);
-                                        publish("📶 Сеть: " + ssid);
-                                    }
-                                }
-                            }
-                        }
-
-                        process.waitFor(10, TimeUnit.SECONDS);
-                    }
-                } catch (Exception e) {
-                    publish("❌ Ошибка airport: " + e.getMessage());
-                }
-                return networks;
-            }
-
-            private List<String> getDemoNetworks() {
-                publish("ℹ️ Используются демонстрационные сети для тестирования");
-
-                // Реалистичные демо-сети
-                String[] demoNetworks = {
-                        "Home_Network_5G",
-                        "TP-Link_Office",
-                        "Moscow_WiFi_Free",
-                        "Yota_Public",
-                        "Beeline_Home",
-                        "MTS_FREE",
-                        "AndroidAP",
-                        "iPhone_Network",
-                        "Xiaomi_Router",
-                        "Asus_RT-AC86U",
-                        "Dlink_DIR-825",
-                        "Huawei_Home",
-                        "Rostelecom",
-                        "Dom.ru_WiFi",
-                        "Starbucks_Free",
-                        "Airport_WiFi",
-                        "Hotel_Guest",
-                        "Conference_Room"
-                };
-
-                // Имитация задержки сканирования
-                try {
-                    Thread.sleep(2000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                }
-
-                return new ArrayList<>(Arrays.asList(demoNetworks));
-            }
-
-            private String formatNetworkInfo(String ssid, String signal, String security) {
-                StringBuilder info = new StringBuilder();
-                info.append(ssid);
-
-                if (!signal.equals("0") && !signal.isEmpty()) {
-                    try {
-                        int signalStrength = Integer.parseInt(signal);
-                        info.append(" (").append(signalStrength).append("%%)");
-                    } catch (NumberFormatException e) {
-                        info.append(" [").append(signal).append("]");
-                    }
-                }
-
-                if (!security.isEmpty() && !security.equals("none")) {
-                    info.append(" - ").append(security);
-                }
-
-                return info.toString();
             }
         };
 
@@ -357,10 +90,10 @@ public class WifiScanner {
     }
 
     public void stopScanning() {
-        if (isScanning && currentWorker != null) {
+        if (currentWorker != null && !currentWorker.isDone()) {
             currentWorker.cancel(true);
             isScanning = false;
-            log("⏹️ Сканирование остановлено пользователем");
+            log("Сканирование остановлено");
         }
     }
 
@@ -368,81 +101,163 @@ public class WifiScanner {
         return isScanning;
     }
 
-    // === ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ===
-
-    private boolean isLinux() {
-        return System.getProperty("os.name").toLowerCase().contains("linux");
+    public List<WifiNetwork> getLastScanResult() {
+        return Collections.unmodifiableList(lastScanResult);
     }
 
-    private boolean isWindows() {
-        return System.getProperty("os.name").toLowerCase().contains("windows");
+    // === Фильтрация ===
+    public List<WifiNetwork> filterNetworks(String filterType) {
+        return switch (filterType) {
+            case "allNetworks" -> lastScanResult;
+            case "strongSignals" -> lastScanResult.stream()
+                    .filter(n -> n.getSignalStrength() >= 60)
+                    .collect(Collectors.toList());
+            case "openNetworks" -> lastScanResult.stream()
+                    .filter(n -> n.getSecurity().equals("Open") || n.getSecurity().contains("None"))
+                    .collect(Collectors.toList());
+            case "securedNetworks" -> lastScanResult.stream()
+                    .filter(n -> !n.getSecurity().equals("Open") && !n.getSecurity().contains("None"))
+                    .collect(Collectors.toList());
+            default -> lastScanResult;
+        };
     }
 
-    private boolean isMac() {
-        return System.getProperty("os.name").toLowerCase().contains("mac");
-    }
-
-    private void log(String message) {
-        if (logger != null) {
-            logger.accept(message);
-        }
-    }
-
-    // === ДОПОЛНИТЕЛЬНЫЕ МЕТОДЫ ДЛЯ РАСШИРЕННОЙ ИНФОРМАЦИИ ===
-
-    public void getDetailedNetworkInfo(String ssid, Consumer<Map<String, String>> callback) {
+    // === Детальная информация ===
+    public void getDetailedInfo(String ssid, Consumer<WifiNetwork> callback) {
         new Thread(() -> {
-            Map<String, String> info = new HashMap<>();
-            try {
-                if (isLinux()) {
-                    info = getNmcliDetailedInfo(ssid);
-                } else if (isWindows()) {
-                    info = getNetshDetailedInfo(ssid);
-                } else if (isMac()) {
-                    info = getAirportDetailedInfo(ssid);
-                }
-            } catch (Exception e) {
-                log("❌ Ошибка получения детальной информации: " + e.getMessage());
+            WifiNetwork network = lastScanResult.stream()
+                    .filter(n -> n.getSsid().equals(ssid))
+                    .findFirst()
+                    .orElse(null);
+
+            if (network != null) {
+                callback.accept(network);
+            } else {
+                callback.accept(new WifiNetwork(ssid, 0, "Unknown", "N/A", "N/A", false));
             }
-            callback.accept(info);
         }).start();
     }
 
-    private Map<String, String> getNmcliDetailedInfo(String ssid) {
-        Map<String, String> info = new HashMap<>();
+    // === ОС-специфичные сканеры ===
+    private List<WifiNetwork> scanWithNmcli() {
+        List<WifiNetwork> networks = new ArrayList<>();
         try {
-            ProcessBuilder pb = new ProcessBuilder("nmcli", "-t", "-f", "ACTIVE,SSID,SIGNAL,SECURITY,FREQ", "dev", "wifi");
+            ProcessBuilder pb = new ProcessBuilder("nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY,FREQ,BSSID", "dev", "wifi");
             Process process = pb.start();
 
             try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
                 String line;
-                while ((line = reader.readLine()) != null) {
-                    String[] parts = line.split(":");
-                    if (parts.length >= 2 && ssid.equals(parts[1])) {
-                        info.put("active", parts[0]);
-                        info.put("signal", parts.length > 2 ? parts[2] : "N/A");
-                        info.put("security", parts.length > 3 ? parts[3] : "N/A");
-                        info.put("frequency", parts.length > 4 ? parts[4] : "N/A");
-                        break;
+                Set<String> seen = new HashSet<>();
+
+                while ((line = reader.readLine()) != null && !isCancelled()) {
+                    String[] parts = line.split(":", -1);
+                    if (parts.length < 1) continue;
+
+                    String ssid = parts[0].trim();
+                    if (ssid.isEmpty() || ssid.equals("--") || seen.contains(ssid)) continue;
+                    seen.add(ssid);
+
+                    int signal = parseSignal(parts.length > 1 ? parts[1] : "0");
+                    String security = parts.length > 2 ? parts[2].trim() : "Open";
+                    String freq = parts.length > 3 ? parts[3].trim() : "2.4 GHz";
+                    String bssid = parts.length > 4 ? parts[4].trim() : "N/A";
+
+                    boolean is5G = freq.contains("5");
+                    networks.add(new WifiNetwork(ssid, signal, security, freq, bssid, is5G));
+                    currentWorker.publish("Обнаружена: " + ssid + " [" + signal + "%]");
+                }
+            }
+            process.waitFor(15, TimeUnit.SECONDS);
+        } catch (Exception e) {
+            currentWorker.publish("nmcli ошибка: " + e.getMessage());
+        }
+        return networks;
+    }
+
+    private boolean isCancelled() {
+        return currentWorker != null && currentWorker.isCancelled();
+    }
+
+    private List<WifiNetwork> scanWithNetsh() {
+        List<WifiNetwork> networks = new ArrayList<>();
+        try {
+            ProcessBuilder pb = new ProcessBuilder("netsh", "wlan", "show", "networks", "mode=bssid");
+            Process process = pb.start();
+
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                WifiNetwork current = null;
+                Pattern ssidPattern = Pattern.compile("SSID \\d+ : (.+)");
+
+                while ((line = reader.readLine()) != null && !isCancelled()) {
+                    line = line.trim();
+
+                    var ssidMatch = ssidPattern.matcher(line);
+                    if (ssidMatch.find()) {
+                        String ssid = ssidMatch.group(1);
+                        if (!networks.stream().anyMatch(n -> n.getSsid().equals(ssid))) {
+                            current = new WifiNetwork(ssid, 0, "Unknown", "2.4/5 GHz", "N/A", false);
+                            networks.add(current);
+                            publish("Сеть: " + ssid);
+                        }
+                    }
+
+                    if (current != null) {
+                        if (line.startsWith("Signal")) {
+                            String signalStr = line.split(":")[1].trim().replace("%", "");
+                            current.setSignalStrength(parseSignal(signalStr));
+                        } else if (line.startsWith("Authentication")) {
+                            current.setSecurity(line.split(":")[1].trim());
+                        }
                     }
                 }
-                process.waitFor(5, TimeUnit.SECONDS);
             }
         } catch (Exception e) {
-            // Игнорируем ошибки детальной информации
+            publish("netsh ошибка: " + e.getMessage());
         }
-        return info;
+        return networks;
     }
 
-    private Map<String, String> getNetshDetailedInfo(String ssid) {
-        Map<String, String> info = new HashMap<>();
-        // Реализация для Windows...
-        return info;
+    private List<WifiNetwork> scanWithAirport() {
+        List<WifiNetwork> networks = new ArrayList<>();
+        publish("Сканирование на macOS: используем airport");
+        // Реализация упрощена
+        return networks;
     }
 
-    private Map<String, String> getAirportDetailedInfo(String ssid) {
-        Map<String, String> info = new HashMap<>();
-        // Реализация для macOS...
-        return info;
+    private List<WifiNetwork> getDemoNetworks() {
+        publish("Демо-режим: генерация тестовых сетей");
+        Random r = new Random();
+        String[] ssids = {
+                "Home_5G", "Office_WiFi", "Guest_Network", "Cafe_Free",
+                "TP-Link_1234", "Beeline_Home", "MTS_5G", "Rostelecom"
+        };
+        String[] securities = {"WPA2", "WPA3", "Open", "WEP"};
+
+        List<WifiNetwork> demo = new ArrayList<>();
+        for (int i = 0; i < 12; i++) {
+            String ssid = ssids[r.nextInt(ssids.length)] + (r.nextBoolean() ? "_5G" : "");
+            int signal = 30 + r.nextInt(70);
+            String security = securities[r.nextInt(securities.length)];
+            boolean is5G = ssid.contains("5G") || r.nextBoolean();
+            demo.add(new WifiNetwork(ssid, signal, security, is5G ? "5 GHz" : "2.4 GHz", "AA:BB:CC:DD:EE:FF", is5G));
+        }
+        try { Thread.sleep(1500); } catch (InterruptedException ignored) {}
+        return demo;
     }
+
+    // === Вспомогательные методы ===
+    private int parseSignal(String signal) {
+        try {
+            return Math.min(100, Math.max(0, Integer.parseInt(signal.replaceAll("\\D", ""))));
+        } catch (Exception e) {
+            return 0;
+        }
+    }
+
+    private boolean isLinux() { return System.getProperty("os.name").toLowerCase().contains("linux"); }
+    private boolean isWindows() { return System.getProperty("os.name").toLowerCase().contains("windows"); }
+    private boolean isMac() { return System.getProperty("os.name").toLowerCase().contains("mac"); }
+
+    private void log(String msg) { if (logger != null) logger.accept(msg); }
 }

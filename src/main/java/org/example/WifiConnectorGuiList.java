@@ -3,814 +3,764 @@ package org.example;
 import com.formdev.flatlaf.FlatDarkLaf;
 import com.formdev.flatlaf.FlatLightLaf;
 import com.formdev.flatlaf.extras.FlatAnimatedLafChange;
+import com.formdev.flatlaf.fonts.roboto.FlatRobotoFont;
 import net.miginfocom.swing.MigLayout;
 import org.pushingpixels.radiance.animation.api.Timeline;
-import org.pushingpixels.radiance.animation.api.Timeline.RepeatBehavior;
-import org.pushingpixels.radiance.animation.api.swing.SwingComponentTimeline;
 
 import javax.swing.*;
-import javax.swing.border.AbstractBorder;
+import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.*;
 import java.awt.geom.RoundRectangle2D;
 import java.awt.image.BufferedImage;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
+import java.util.*;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.prefs.Preferences;
 
 public class WifiConnectorGuiList extends JFrame {
-    private DefaultListModel<String> listModel = new DefaultListModel<>();
-    private JList<String> ssidList = new JList<>(listModel);
-    private JPasswordField passwordField = new JPasswordField();
-    private JTextArea logArea = new JTextArea(10, 50);
-    private JButton refreshButton = new JButton("🔄 Обновить");
-    private JButton connectButton = new JButton("🔗 Подключить");
-    private JButton disconnectButton = new JButton("🔌 Отключить");
-    private JButton bruteForceButton = new JButton("🔓 Подобрать пароль");
-    private JButton themeToggleButton = new JButton("🌙");
-    private JCheckBox showPasswordsCheckbox = new JCheckBox("Показывать пароли");
-    private JCheckBox autoConnectCheckbox = new JCheckBox("Автоподключение");
-    private ModernProgressBar progressBar = new ModernProgressBar();
-    private JLabel statusLabel = new JLabel("Готов к работе");
-    private JLabel signalStrengthLabel = new JLabel("💡 Выберите сеть для информации");
-    private JLabel connectionStatusLabel = new JLabel("🔴 Не подключено");
-    private JComboBox<String> filterComboBox = new JComboBox<>(new String[]{"Все сети", "Сильные сигналы", "Открытые сети", "Защищенные сети"});
+    private static final ResourceBundle BUNDLE = ResourceBundle.getBundle("messages");
+    private static final Preferences PREFS = Preferences.userNodeForPackage(WifiConnectorGuiList.class);
+    private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private WifiScanner wifiScanner;
-    private WifiConnector wifiConnector;
+    // === UI COMPONENTS ===
+    private DefaultListModel<WifiNetwork> listModel = new DefaultListModel<>();
+    private JList<WifiNetwork> networkList = new JList<>(listModel);
+    private JPasswordField passwordField = new JPasswordField(20);
+    private JTextArea logArea = new JTextArea(12, 50);
+    private ModernProgressBar progressBar = new ModernProgressBar();
+    private JLabel statusLabel = new JLabel(BUNDLE.getString("ready"));
+    private JLabel connectionStatusLabel = new JLabel(BUNDLE.getString("notConnected"));
+    private JLabel signalInfoLabel = new JLabel(BUNDLE.getString("selectNetwork"));
+    private JLabel attemptsLabel = new JLabel("");
+    private JComboBox<String> filterCombo = new JComboBox<>(new String[]{
+            BUNDLE.getString("allNetworks"),
+            BUNDLE.getString("strongSignals"),
+            BUNDLE.getString("openNetworks"),
+            BUNDLE.getString("securedNetworks")
+    });
+    private JComboBox<String> logFilterCombo = new JComboBox<>(new String[]{
+            BUNDLE.getString("allLogs"), BUNDLE.getString("errorsOnly"),
+            BUNDLE.getString("successOnly"), BUNDLE.getString("warningsOnly")
+    });
+
+    private JButton refreshBtn = new JButton(BUNDLE.getString("refresh"));
+    private JButton connectBtn = new JButton(BUNDLE.getString("connect"));
+    private JButton disconnectBtn = new JButton(BUNDLE.getString("disconnect"));
+    private JButton bruteBtn = new JButton(BUNDLE.getString("bruteforce"));
+    private JButton themeBtn = new JButton("");
+    private JButton settingsBtn = new JButton("");
+    private JButton exportBtn = new JButton("");
+    private JCheckBox showPassChk = new JCheckBox(BUNDLE.getString("showPasswords"));
+    private JCheckBox autoConnChk = new JCheckBox(BUNDLE.getString("autoConnect"));
+
+    // === BUSINESS LOGIC ===
+    private WifiScanner scanner;
+    private WifiConnector connector;
     private PasswordBruteForcer bruteForcer;
 
+    // === STATE ===
     private boolean darkTheme = true;
+    private Timer autoRefresh;
+    private int scanInterval = 30;
+    private boolean autoRefreshEnabled = true;
+    private List<WifiNetwork> lastScan = new ArrayList<>();
 
     public WifiConnectorGuiList() {
-        super("Wi-Fi Connector Pro");
+        super(BUNDLE.getString("appTitle"));
         setDefaultCloseOperation(EXIT_ON_CLOSE);
-
-        wifiScanner = new WifiScanner(this::appendLog);
-        wifiConnector = new WifiConnector(this::appendLog);
-        bruteForcer = new PasswordBruteForcer(wifiConnector, this::appendLog);
-
-        setupProfessionalUI();
+        loadPrefs();
+        initComponents();
+        setupUI();
+        setupLogic();
         pack();
+        setSize(1200, 900);
         setLocationRelativeTo(null);
-        addListeners();
+        setVisible(true);
+        restartAutoRefreshTimer(); // вместо startAutoRefresh()
         scanNetworks();
     }
 
-    private void setupProfessionalUI() {
-        setLayout(new MigLayout("fill, insets 30", "[grow]", "[][grow][]"));
-
-        add(createHeaderPanel(), "grow, wrap");
-        add(createContentPanel(), "grow, wrap");
-        add(createBottomPanel(), "grow");
-
-        setIconImage(createModernAppIcon());
-        setMinimumSize(new Dimension(1000, 800));
-        setPreferredSize(new Dimension(1200, 900));
+    private void initComponents() {
+        scanner = new WifiScanner(this::log);
+        connector = new WifiConnector(this::log);
+        bruteForcer = new PasswordBruteForcer(connector, this::log);
     }
 
-    private JPanel createHeaderPanel() {
-        JPanel panel = new ModernCardPanel();
-        panel.setLayout(new MigLayout("fill, insets 20", "[grow][]", "[]"));
+    private void setupUI() {
+        FlatRobotoFont.install();
+        setLayout(new MigLayout("fill, insets 15", "[grow]", "[][grow][]"));
+        getContentPane().setBackground(darkTheme ? new Color(18, 18, 18) : new Color(245, 245, 245));
 
-        JLabel titleLabel = new JLabel("🌐 Wi-Fi Connector Pro");
-        titleLabel.setFont(new Font("Segoe UI", Font.BOLD, 28));
+        add(createHeader(), "wrap");
+        add(createMainPanel(), "grow, wrap");
+        add(createLogPanel(), "grow");
 
-        JLabel subtitleLabel = new JLabel("Управляй Wi-Fi соединениями легко и эффективно");
-        subtitleLabel.setFont(new Font("Segoe UI", Font.PLAIN, 14));
+        setIconImage(createIcon());
+        applyTheme();
+    }
 
-        JPanel titlePanel = new JPanel(new MigLayout("insets 0, gapy 0", "[grow]", "[]0[]"));
-        titlePanel.setOpaque(false);
-        titlePanel.add(titleLabel, "wrap");
-        titlePanel.add(subtitleLabel);
+    // === ОСТА • НЕ ТРОГАЙ НИЖЕ — РАБОТАЕТ ===
 
-        JPanel rightPanel = new JPanel(new MigLayout("insets 0, gapx 10", "[][][]", "[]"));
-        rightPanel.setOpaque(false);
+    private JPanel createHeader() {
+        JPanel p = new ModernCardPanel();
+        p.setLayout(new MigLayout("fill, insets 20", "[grow][]", "[]"));
 
+        JLabel title = new JLabel("Wi-Fi Connector Pro");
+        title.setFont(new Font("Segoe UI", Font.BOLD, 28));
+        title.setForeground(darkTheme ? Color.WHITE : Color.BLACK);
+
+        JPanel right = new JPanel(new MigLayout("insets 0", "[][]10[]10[]", "[]"));
+        right.setOpaque(false);
         connectionStatusLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
-        rightPanel.add(connectionStatusLabel);
+        right.add(connectionStatusLabel);
+        right.add(new JLabel(BUNDLE.getString("filter") + ":"));
+        setupCombo(filterCombo);
+        right.add(filterCombo);
+        settingsBtn.setIcon(new ImageIcon(createIcon(24, "settings")));
+        themeBtn.setIcon(new ImageIcon(createIcon(24, darkTheme ? "moon" : "sun")));
+        styleIconBtn(settingsBtn); styleIconBtn(themeBtn);
+        right.add(settingsBtn); right.add(themeBtn);
 
-        JLabel filterLabel = new JLabel("Фильтр:");
-        filterLabel.setFont(new Font("Segoe UI", Font.BOLD, 12));
-        rightPanel.add(filterLabel);
-
-        setupModernComboBox(filterComboBox);
-        rightPanel.add(filterComboBox);
-
-        themeToggleButton.setPreferredSize(new Dimension(40, 40));
-        styleIconButton(themeToggleButton);
-        rightPanel.add(themeToggleButton);
-
-        panel.add(titlePanel, "grow");
-        panel.add(rightPanel);
-
-        return panel;
+        p.add(title, "grow");
+        p.add(right);
+        return p;
     }
 
-    private JPanel createContentPanel() {
-        JPanel panel = new JPanel(new MigLayout("fill, insets 0", "[400:400:500][300:300:400]", "[grow]"));
-        panel.setOpaque(false);
-
-        panel.add(createNetworksPanel(), "grow");
-        panel.add(createControlPanel(), "grow");
-
-        return panel;
+    private JPanel createMainPanel() {
+        JPanel p = new JPanel(new MigLayout("fill", "[450!][grow]", "[grow]"));
+        p.setOpaque(false);
+        p.add(createNetworkPanel(), "grow");
+        p.add(createControlPanel(), "grow");
+        return p;
     }
 
-    private JPanel createNetworksPanel() {
-        JPanel panel = new ModernCardPanel();
-        panel.setLayout(new MigLayout("fill, insets 20", "[grow]", "[][grow][]"));
+    private JPanel createNetworkPanel() {
+        JPanel p = new ModernCardPanel();
+        p.setLayout(new MigLayout("fill, insets 20", "[grow]", "[]8[grow]8[]"));
 
-        JLabel titleLabel = new ModernSectionLabel("📶 Доступные сети Wi-Fi");
-        panel.add(titleLabel, "wrap");
+        p.add(new ModernSectionLabel("availableNetworks"), "wrap");
+        networkList.setCellRenderer(new NetworkRenderer());
+        networkList.setFixedCellHeight(68);
+        JScrollPane scroll = new ModernScrollPane(networkList);
+        p.add(scroll, "grow, wrap");
 
-        ssidList.setFont(new Font("Segoe UI", Font.PLAIN, 14));
-        ssidList.setCellRenderer(new ModernNetworkListRenderer());
+        signalInfoLabel.setForeground(darkTheme ? new Color(173, 181, 189) : new Color(100, 100, 100));
+        JPanel info = new JPanel(new MigLayout("insets 10"));
+        info.setBackground(darkTheme ? new Color(33, 37, 43) : new Color(230, 230, 230));
+        info.setBorder(BorderFactory.createLineBorder(darkTheme ? new Color(52, 58, 70) : new Color(200, 200, 200)));
+        info.add(signalInfoLabel);
+        p.add(info, "grow");
 
-        JScrollPane scrollPane = new ModernScrollPane(ssidList);
-        panel.add(scrollPane, "grow, wrap");
-
-        signalStrengthLabel.setFont(new Font("Segoe UI", Font.PLAIN, 12));
-        JPanel infoPanel = createInfoPanel();
-        infoPanel.add(signalStrengthLabel);
-        panel.add(infoPanel, "grow");
-
-        return panel;
+        return p;
     }
 
     private JPanel createControlPanel() {
-        JPanel panel = new ModernCardPanel();
-        panel.setLayout(new MigLayout("fill, insets 20", "[grow]", "[][grow]"));
+        JPanel p = new ModernCardPanel();
+        p.setLayout(new MigLayout("fill, insets 20", "[grow]", "[]20[grow]"));
 
-        panel.add(new ModernSectionLabel("⚙️ Управление подключением"), "wrap");
+        p.add(new ModernSectionLabel("connectionManagement"), "wrap");
 
-        JPanel content = new JPanel(new MigLayout("fill, insets 0", "[grow]", "[][][][grow]"));
+        JPanel content = new JPanel(new MigLayout("fill", "[grow]", "[]10[]10[]20[grow]"));
         content.setOpaque(false);
 
-        content.add(createPasswordPanel(), "grow, wrap");
-        content.add(createOptionsPanel(), "grow, wrap");
-        content.add(createButtonsPanel(), "grow, wrap");
-        content.add(createProgressPanel(), "grow");
+        // Password
+        JPanel passPanel = new JPanel(new MigLayout("fill", "[grow][]", "[]"));
+        passPanel.setOpaque(false);
+        passPanel.add(new ModernFieldLabel("networkPassword"), "wrap");
+        passwordField.setFont(new Font("Segoe UI", Font.PLAIN, 15));
+        passwordField.putClientProperty("JTextField.placeholderText", BUNDLE.getString("enterPassword"));
+        passPanel.add(passwordField, "grow");
+        JButton eye = new JButton("show");
+        styleIconBtn(eye);
+        eye.addActionListener(e -> togglePassword(eye));
+        passPanel.add(eye);
 
-        panel.add(content, "grow");
+        // Options
+        JPanel opts = new JPanel(new MigLayout("gapy 8"));
+        opts.setOpaque(false);
+        setupCheckbox(showPassChk); setupCheckbox(autoConnChk);
+        opts.add(showPassChk, "wrap"); opts.add(autoConnChk);
 
-        return panel;
-    }
+        // Buttons
+        JPanel btns = new JPanel(new MigLayout("fill", "[grow][grow]", "[grow][grow]"));
+        btns.setOpaque(false);
+        stylePrimaryBtn(refreshBtn, new Color(0, 122, 255));
+        stylePrimaryBtn(connectBtn, new Color(52, 199, 89));
+        styleSecondaryBtn(disconnectBtn, new Color(255, 149, 0));
+        styleSecondaryBtn(bruteBtn, new Color(151, 92, 228));
+        btns.add(refreshBtn, "grow"); btns.add(connectBtn, "grow, wrap");
+        btns.add(disconnectBtn, "grow"); btns.add(bruteBtn, "grow");
 
-    private JPanel createPasswordPanel() {
-        JPanel panel = new JPanel(new MigLayout("fill, insets 0", "[grow][]", "[]0[]"));
-        panel.setOpaque(false);
-
-        JLabel label = new ModernFieldLabel("🔑 Пароль сети");
-        panel.add(label, "wrap");
-
-        passwordField.setFont(new Font("Segoe UI", Font.PLAIN, 14));
-        passwordField.putClientProperty("JTextField.placeholderText", "Введите пароль...");
-        panel.add(passwordField, "grow");
-
-        JButton toggleBtn = new JButton("👁");
-        toggleBtn.setPreferredSize(new Dimension(45, 45));
-        styleIconButton(toggleBtn);
-        panel.add(toggleBtn);
-
-        toggleBtn.addActionListener(e -> togglePasswordVisibility(toggleBtn));
-
-        return panel;
-    }
-    private JPanel createOptionsPanel() {
-        JPanel panel = new JPanel(new MigLayout("insets 15 0 15 0, gapy 8", "[grow]", "[]8[]"));
-        panel.setOpaque(false);
-
-        setupModernCheckbox(showPasswordsCheckbox);
-        setupModernCheckbox(autoConnectCheckbox);
-
-        panel.add(showPasswordsCheckbox, "grow, wrap");
-        panel.add(autoConnectCheckbox, "grow");
-
-        return panel;
-    }
-
-    private JPanel createButtonsPanel() {
-        JPanel panel = new JPanel(new MigLayout("fill, insets 0", "[grow][grow]", "[grow][grow]"));
-        panel.setOpaque(false);
-
-        styleModernButton(refreshButton, new Color(0, 122, 255));
-        styleModernButton(connectButton, new Color(52, 199, 89));
-        styleModernButton(disconnectButton, new Color(255, 149, 0));
-        styleModernButton(bruteForceButton, new Color(151, 92, 228));
-
-        panel.add(refreshButton, "grow");
-        panel.add(connectButton, "grow, wrap");
-        panel.add(disconnectButton, "grow");
-        panel.add(bruteForceButton, "grow");
-
-        return panel;
-    }
-
-    private JPanel createProgressPanel() {
-        JPanel panel = new JPanel(new MigLayout("fill, insets 10 0 0 0", "[grow]", "[grow][]"));
-        panel.setOpaque(false);
-
+        // Progress
+        JPanel prog = new JPanel(new MigLayout("fill", "[grow]", "[grow][]"));
+        prog.setOpaque(false);
         progressBar.setVisible(false);
-        panel.add(progressBar, "grow, wrap");
-
+        prog.add(progressBar, "grow, wrap");
+        JPanel statusP = new JPanel(new MigLayout("fill", "[grow][]"));
+        statusP.setOpaque(false);
         statusLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
-        panel.add(statusLabel, "grow");
+        statusP.add(statusLabel, "grow");
+        statusP.add(attemptsLabel);
+        prog.add(statusP, "grow");
 
-        return panel;
+        content.add(passPanel, "grow, wrap");
+        content.add(opts, "grow, wrap");
+        content.add(btns, "grow, wrap");
+        content.add(prog, "grow");
+        p.add(content, "grow");
+        return p;
     }
 
+    private JPanel createLogPanel() {
+        JPanel p = new ModernCardPanel();
+        p.setLayout(new MigLayout("fill, insets 20", "[grow]", "[]8[grow]8[]"));
 
-    private JPanel createBottomPanel() {
-        JPanel panel = new JPanel(new MigLayout("fill, insets 0", "[grow]", "[grow]"));
-        panel.setOpaque(false);
+        // === Заголовок с фильтром ===
+        JPanel header = new JPanel(new MigLayout("fill", "[grow][]"));
+        header.setOpaque(false);
+        header.add(new ModernSectionLabel("eventLog"), "grow");
+        header.add(new JLabel(BUNDLE.getString("logFilter") + ":"));
+        setupCombo(logFilterCombo);
+        logFilterCombo.addActionListener(e -> filterLogs()); // ← Добавлено!
+        header.add(logFilterCombo);
 
-        JPanel logPanel = new ModernCardPanel();
-        logPanel.setLayout(new MigLayout("fill, insets 20", "[grow]", "[][grow][]"));
+        p.add(header, "wrap");
 
-        logPanel.add(new ModernSectionLabel("📝 Журнал событий"), "wrap");
-
-        logArea.setFont(new Font("JetBrains Mono", Font.PLAIN, 12));
+        // === Область логов ===
         logArea.setEditable(false);
-        logArea.setLineWrap(true);
-        logArea.setWrapStyleWord(true);
+        logArea.setFont(new Font("JetBrains Mono", Font.PLAIN, 12));
+        logArea.setBackground(darkTheme ? new Color(13, 17, 23) : Color.WHITE);
+        logArea.setForeground(darkTheme ? new Color(248, 249, 250) : Color.BLACK);
+        JScrollPane scroll = new ModernScrollPane(logArea);
+        p.add(scroll, "grow, wrap");
 
-        JScrollPane logScroll = new ModernScrollPane(logArea);
-        logPanel.add(logScroll, "grow, wrap");
+        // === Кнопки: Экспорт + Очистка ===
+        JPanel controls = new JPanel(new MigLayout("right"));
+        controls.setOpaque(false);
 
-        JPanel logControls = new JPanel(new MigLayout("insets 0", "[right]", "[]"));
-        logControls.setOpaque(false);
+        // Экспорт — используем эмодзи "download"
+        exportBtn.setIcon(new ImageIcon(createIcon(20, "download")));
+        styleIconBtn(exportBtn);
+        exportBtn.addActionListener(e -> exportLog());
 
-        JButton clearBtn = new JButton("Очистить");
-        styleModernButton(clearBtn, new Color(108, 117, 125));
-        clearBtn.setPreferredSize(new Dimension(100, 35));
-        logControls.add(clearBtn);
+        JButton clear = new JButton(BUNDLE.getString("clear"));
+        styleSecondaryBtn(clear, new Color(108, 117, 125));
+        clear.addActionListener(e -> clearLog());
 
-        clearBtn.addActionListener(e -> logArea.setText(""));
+        controls.add(exportBtn);
+        controls.add(clear);
+        p.add(controls, "grow");
 
-        logPanel.add(logControls, "grow");
-
-        panel.add(logPanel, "grow");
-
-        return panel;
+        return p;
     }
 
-    private JPanel createInfoPanel() {
-        JPanel panel = new JPanel(new MigLayout("insets 15", "[grow]", "[]"));
-        panel.setBackground(new Color(248, 249, 250));
-        panel.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(222, 226, 230)),
-                BorderFactory.createEmptyBorder(10, 15, 10, 15)
-        ));
-        return panel;
+    private void clearLog() {
+        logArea.setText("");
+        log("logCleared");
     }
 
-    private void setupModernComboBox(JComboBox<String> comboBox) {
-        comboBox.setFont(new Font("Segoe UI", Font.PLAIN, 12));
-        comboBox.setPreferredSize(new Dimension(160, 40));
-    }
+    // === LISTENERS ===
+    private void setupLogic() {
+        refreshBtn.addActionListener(e -> scanNetworks());
+        connectBtn.addActionListener(e -> connectSelected());
+        disconnectBtn.addActionListener(e -> disconnect());
+        bruteBtn.addActionListener(e -> toggleBruteForce());
+        themeBtn.addActionListener(e -> toggleTheme());
+        settingsBtn.addActionListener(e -> showSettings());
+        filterCombo.addActionListener(e -> applyFilter());
+        logFilterCombo.addActionListener(e -> filterLogs());
 
-    private void setupModernCheckbox(JCheckBox checkbox) {
-        checkbox.setFont(new Font("Segoe UI", Font.PLAIN, 13));
-        checkbox.setOpaque(false);
-    }
+        networkList.addListSelectionListener(e -> {
+            if (!e.getValueIsAdjusting()) updateInfo();
+        });
 
-    private void styleModernButton(JButton button, Color color) {
-        button.setFont(new Font("Segoe UI", Font.BOLD, 13));
-        button.setFocusPainted(false);
-        button.setBackground(color);
-        button.setForeground(Color.WHITE);
-        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
-
-        SwingComponentTimeline timeline = SwingComponentTimeline.componentBuilder(button)
-                .addPropertyToInterpolate("background", color, color.brighter())
-                .setDuration(200)
-                .build();
-
-        button.addMouseListener(new MouseAdapter() {
-            public void mouseEntered(MouseEvent e) {
-                timeline.play();
+        networkList.addMouseListener(new MouseAdapter() {
+            public void mouseClicked(MouseEvent e) {
+                if (e.getClickCount() == 2) passwordField.requestFocus();
             }
-            public void mouseExited(MouseEvent e) {
-                timeline.playReverse();
-            }
+        });
+
+        setupShortcuts();
+    }
+
+    private void scanNetworks() {
+        setBusy(true, "scanningNetworks");
+        scanner.scanNetworks(networks -> {
+            lastScan = networks;
+            SwingUtilities.invokeLater(() -> {
+                listModel.clear();
+                networks.forEach(listModel::addElement);
+                setBusy(false, networks.isEmpty() ? "noNetworks" : "foundNetworks " + networks.size());
+                if (!networks.isEmpty()) networkList.setSelectedIndex(0);
+            });
         });
     }
 
-    private void styleIconButton(JButton button) {
-        button.setFocusPainted(false);
-        button.setBorder(BorderFactory.createEmptyBorder(8, 8, 8, 8));
-        button.setCursor(new Cursor(Cursor.HAND_CURSOR));
-        button.setBackground(new Color(73, 73, 74));
-        button.setForeground(Color.WHITE);
-
-        Timeline timeline = Timeline.builder(button)
-                .addPropertyToInterpolate("background", new Color(73, 73, 74), new Color(99, 99, 102))
-                .setDuration(150)
-                .build();
-
-        button.addMouseListener(new MouseAdapter() {
-            public void mouseEntered(MouseEvent e) {
-                timeline.play();
-            }
-            public void mouseExited(MouseEvent e) {
-                timeline.playReverse();
-            }
+    private void connectSelected() {
+        WifiNetwork net = networkList.getSelectedValue();
+        if (net == null) { toast("selectNetworkFirst", Color.RED); return; }
+        String pass = new String(passwordField.getPassword());
+        setBusy(true, "connectingTo " + net.getSsid());
+        connector.connectToNetwork(net.getSsid(), pass, success -> {
+            SwingUtilities.invokeLater(() -> {
+                setBusy(false, success ? "connectedTo " + net.getSsid() : "connectionError");
+                if (success) updateConnectionStatus(net.getSsid(), true);
+            });
         });
     }
 
-    private void togglePasswordVisibility(JButton toggleBtn) {
-        if (passwordField.getEchoChar() == 0) {
-            passwordField.setEchoChar('•');
-            toggleBtn.setText("👁");
+    private void disconnect() {
+        connector.disconnectFromNetwork(success -> {
+            SwingUtilities.invokeLater(() -> {
+                setBusy(false, success ? "disconnected" : "disconnectError");
+                updateConnectionStatus(null, false);
+            });
+        });
+    }
+
+    private void toggleBruteForce() {
+        WifiNetwork net = networkList.getSelectedValue();
+        if (net == null) { toast("selectNetworkFirst", Color.RED); return; }
+
+        if (bruteForcer.isRunning()) {
+            bruteForcer.stopBruteForce();
+            bruteBtn.setText(BUNDLE.getString("bruteforce"));
+            bruteBtn.setBackground(new Color(151, 92, 228));
+            setBusy(false, "bruteForceStopped");
         } else {
-            passwordField.setEchoChar((char) 0);
-            toggleBtn.setText("🙈");
+            setBusy(true, "bruteForcing " + net.getSsid());
+            bruteBtn.setText(BUNDLE.getString("stop"));
+            bruteBtn.setBackground(new Color(255, 59, 48));
+            bruteForcer.startBruteForce(net.getSsid(), net.getBssid(), password -> {
+                SwingUtilities.invokeLater(() -> {
+                    if (password != null) {
+                        passwordField.setText(password);
+                        log("passwordFound: " + (password.startsWith("WPS:") ? "WPS PIN" : password));
+                        setBusy(false, "passwordFound");
+                        if (autoConnChk.isSelected()) connectSelected();
+                    } else {
+                        setBusy(false, "passwordNotFound");
+                    }
+                    bruteBtn.setText(BUNDLE.getString("bruteforce"));
+                    bruteBtn.setBackground(new Color(151, 92, 228));
+                });
+            });
         }
     }
 
-    private void addListeners() {
-        refreshButton.addActionListener(e -> scanNetworks());
-
-        connectButton.addActionListener(e -> {
-            String ssid = ssidList.getSelectedValue();
-            if (ssid == null || ssid.isEmpty()) {
-                showToast("Выберите сеть из списка", new Color(255, 59, 48));
-                return;
-            }
-            connectToNetwork(ssid, new String(passwordField.getPassword()));
+    private void updateInfo() {
+        WifiNetwork net = networkList.getSelectedValue();
+        if (net == null) return;
+        scanner.getDetailedInfo(net.getSsid(), info -> {
+            SwingUtilities.invokeLater(() -> {
+                String signal = switch (info.getSignalStrength() / 20) {
+                    case 5 -> "excellentSignal";
+                    case 4 -> "goodSignal";
+                    case 3 -> "averageSignal";
+                    case 2 -> "weakSignal";
+                    default -> "veryWeakSignal";
+                };
+                String sec = info.getSecurity().equals("Open") ? "openNetwork" : "security" + info.getSecurity();
+                signalInfoLabel.setText(BUNDLE.getString(signal) +
+                        (info.is5G() ? " [5G]" : "") + " • " + BUNDLE.getString(sec));
+            });
         });
+    }
 
-        disconnectButton.addActionListener(e -> disconnectFromNetwork());
+    private void applyFilter() {
+        String filter = (String) filterCombo.getSelectedItem();
+        List<WifiNetwork> filtered = scanner.filterNetworks(
+                switch (filter) {
+                    case "strongSignals" -> "strongSignals";
+                    case "openNetworks" -> "openNetworks";
+                    case "securedNetworks" -> "securedNetworks";
+                    default -> "allNetworks";
+                }
+        );
+        listModel.clear();
+        filtered.forEach(listModel::addElement);
+    }
 
-        bruteForceButton.addActionListener(e -> {
-            String ssid = ssidList.getSelectedValue();
-            if (ssid == null || ssid.isEmpty()) {
-                showToast("Выберите сеть из списка", new Color(255, 59, 48));
-                return;
-            }
-
-            if (bruteForcer.isRunning()) {
-                stopBruteForce();
-            } else {
-                startBruteForce(ssid);
-            }
-        });
-
-        themeToggleButton.addActionListener(e -> toggleTheme());
-
-        ssidList.addListSelectionListener(e -> {
-            if (!e.getValueIsAdjusting()) {
-                String selected = ssidList.getSelectedValue();
-                if (selected != null) {
-                    statusLabel.setText("Выбрана сеть: " + selected);
-                    updateNetworkInfo(selected);
+    // === УПРАВЛЕНИЕ ТАЙМЕРОМ ===
+    private void restartAutoRefreshTimer() {
+        if (autoRefresh != null) {
+            autoRefresh.cancel();
+            autoRefresh.purge();
+        }
+        autoRefresh = new Timer("AutoRefresh", true);
+        TimerTask task = new TimerTask() {
+            @Override
+            public void run() {
+                if (isVisible() && !progressBar.isVisible()) {
+                    SwingUtilities.invokeLater(WifiConnectorGuiList.this::scanNetworks);
                 }
             }
-        });
+        };
+        autoRefresh.scheduleAtFixedRate(task, scanInterval * 1000L, scanInterval * 1000L);
+    }
 
-        ssidList.addMouseListener(new MouseAdapter() {
-            public void mouseClicked(MouseEvent e) {
-                if (e.getClickCount() == 2) {
-                    String ssid = ssidList.getSelectedValue();
-                    if (ssid != null) {
-                        passwordField.requestFocusInWindow();
-                        appendLog("🔄 Двойной клик по сети: " + ssid);
-                    }
-                }
+    // === НАСТРОЙКИ ===
+    private void showSettings() {
+        JDialog d = new JDialog(this, BUNDLE.getString("settings"), true);
+        d.setLayout(new MigLayout("fill, insets 20", "[grow]", "[][][][]"));
+        JSpinner spin = new JSpinner(new SpinnerNumberModel(scanInterval, 5, 300, 5));
+        JCheckBox auto = new JCheckBox(BUNDLE.getString("autoRefresh"), autoRefreshEnabled);
+        d.add(new JLabel(BUNDLE.getString("scanInterval") + " (s):"), "wrap");
+        d.add(spin, "wrap");
+        d.add(auto, "wrap");
+        JButton save = new JButton(BUNDLE.getString("save"));
+        save.addActionListener(e -> {
+            int newInterval = (int) spin.getValue();
+            boolean newEnabled = auto.isSelected();
+
+            if (newInterval != scanInterval || newEnabled != autoRefreshEnabled) {
+                scanInterval = newInterval;
+                autoRefreshEnabled = newEnabled;
+                PREFS.putInt("scanInterval", scanInterval);
+                PREFS.putBoolean("autoRefreshEnabled", autoRefreshEnabled);
+                restartAutoRefreshTimer();
+                log("Settings updated: interval=" + scanInterval + "s, autoRefresh=" + autoRefreshEnabled);
             }
+            d.dispose();
         });
+        d.add(save, "tag ok, span, right");
+        d.pack();
+        d.setLocationRelativeTo(this);
+        d.setVisible(true);
+    }
 
-        filterComboBox.addActionListener(e -> {
-            String filter = (String) filterComboBox.getSelectedItem();
-            appendLog("🔍 Применен фильтр: " + filter);
-        });
+    // === UTILS ===
+    private void setBusy(boolean busy, String msgKey) {
+        progressBar.setVisible(busy);
+        progressBar.setIndeterminate(busy);
+        statusLabel.setText(busy ? BUNDLE.getString(msgKey) : BUNDLE.getString("ready"));
+        boolean enabled = !busy;
+        refreshBtn.setEnabled(enabled);
+        connectBtn.setEnabled(enabled && networkList.getSelectedValue() != null);
+        disconnectBtn.setEnabled(enabled);
+        networkList.setEnabled(enabled);
+        passwordField.setEnabled(enabled);
+    }
+
+    private void updateConnectionStatus(String ssid, boolean connected) {
+        connectionStatusLabel.setText(connected ? BUNDLE.getString("connectedTo") + " " + ssid : BUNDLE.getString("notConnected"));
+        connectionStatusLabel.setForeground(connected ? new Color(52, 199, 89) : new Color(255, 59, 48));
+    }
+
+    private void togglePassword(JButton btn) {
+        char echo = passwordField.getEchoChar();
+        passwordField.setEchoChar(echo == 0 ? '•' : 0);
+        btn.setText(echo == 0 ? "show" : "hide");
     }
 
     private void toggleTheme() {
         FlatAnimatedLafChange.showSnapshot();
-
-        try {
-            if (darkTheme) {
-                FlatLightLaf.setup();
-                themeToggleButton.setText("🌞");
-            } else {
-                FlatDarkLaf.setup();
-                themeToggleButton.setText("🌙");
-            }
-            darkTheme = !darkTheme;
-
-            SwingUtilities.updateComponentTreeUI(this);
-        } catch (Exception ex) {
-            ex.printStackTrace();
-        }
-
+        darkTheme = !darkTheme;
+        if (darkTheme) FlatDarkLaf.setup(); else FlatLightLaf.setup();
+        PREFS.putBoolean("darkTheme", darkTheme);
+        themeBtn.setIcon(new ImageIcon(createIcon(24, darkTheme ? "moon" : "sun")));
+        SwingUtilities.updateComponentTreeUI(this);
         FlatAnimatedLafChange.hideSnapshotWithAnimation();
     }
 
-    private void showToast(String message, Color color) {
-        JWindow toast = new JWindow();
-        toast.setLayout(new BorderLayout());
 
-        JLabel label = new JLabel(message, SwingConstants.CENTER);
-        label.setForeground(Color.WHITE);
-        label.setFont(new Font("Segoe UI", Font.BOLD, 14));
-        label.setBorder(BorderFactory.createEmptyBorder(15, 25, 15, 25));
+    private void setupShortcuts() {
+        InputMap im = getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW);
+        ActionMap am = getRootPane().getActionMap();
 
-        JPanel content = new JPanel() {
+        im.put(KeyStroke.getKeyStroke("ctrl R"), "refresh");
+        im.put(KeyStroke.getKeyStroke("ENTER"), "connect");
+        im.put(KeyStroke.getKeyStroke("ESCAPE"), "cancel");
+
+        am.put("refresh", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                scanNetworks();
+            }
+        });
+
+        am.put("connect", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                connectSelected();
+            }
+        });
+
+        am.put("cancel", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                if (bruteForcer.isRunning()) {
+                    toggleBruteForce();
+                }
+            }
+        });
+    }
+
+    private void toast(String key, Color bg) {
+        JWindow w = new JWindow(this);
+        JLabel l = new JLabel(BUNDLE.getString(key), SwingConstants.CENTER);
+        l.setForeground(Color.WHITE);
+        l.setFont(new Font("Segoe UI", Font.BOLD, 14));
+        JPanel p = new JPanel() {
             @Override
             protected void paintComponent(Graphics g) {
                 Graphics2D g2 = (Graphics2D) g.create();
                 g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-                g2.setColor(color);
-                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 25, 25);
+                g2.setColor(bg);
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 20, 20);
                 g2.dispose();
             }
         };
-        content.setLayout(new BorderLayout());
-        content.add(label);
-
-        toast.setContentPane(content);
-        toast.setSize(300, 60);
-        toast.setLocationRelativeTo(null);
-
-        animateToast(toast);
-    }
-
-    private void animateToast(JWindow toast) {
-        toast.setOpacity(0f);
-        toast.setVisible(true);
-
-        Timeline.builder(toast)
+        p.setLayout(new BorderLayout());
+        p.add(l);
+        w.setContentPane(p);
+        w.setSize(320, 60);
+        w.setLocationRelativeTo(this);
+        w.setOpacity(0f);
+        w.setVisible(true);
+        Timeline.builder(w)
                 .addPropertyToInterpolate("opacity", 0f, 1f)
-                .addPropertyToInterpolate("location",
-                        new Point(toast.getX(), toast.getY() + 20),
-                        new Point(toast.getX(), toast.getY()))
-                .setDuration(300)
-                .play();
-
-        Timeline.builder(toast)
-                .addPropertyToInterpolate("opacity", 1f, 0f)
-                .addPropertyToInterpolate("location",
-                        new Point(toast.getX(), toast.getY()),
-                        new Point(toast.getX(), toast.getY() - 20))
-                .setDuration(300)
-                .play();
-
-        new Timer(3100, e -> {
-            toast.dispose();
+                .setDuration(300).play();
+        new Timer(2500, e -> {
+            Timeline.builder(w).addPropertyToInterpolate("opacity", 1f, 0f).setDuration(300).play();
+            new Timer(300, ee -> w.dispose()).start();
         }).start();
     }
 
-    private void updateNetworkInfo(String ssid) {
-        int signalStrength = (int)(Math.random() * 5) + 1;
-        boolean isSecure = Math.random() > 0.3;
-
-        String signalText = switch (signalStrength) {
-            case 5 -> "📶 Отличный сигнал";
-            case 4 -> "📶 Хороший сигнал";
-            case 3 -> "📶 Средний сигнал";
-            case 2 -> "📶 Слабый сигнал";
-            default -> "📶 Очень слабый сигнал";
-        };
-
-        String securityText = isSecure ? "🔒 Защита: WPA2" : "🔓 Открытая сеть";
-        signalStrengthLabel.setText(signalText + " • " + securityText);
-    }
-
-    private void scanNetworks() {
-        setControlsEnabled(false);
-        statusLabel.setText("🔍 Сканирование сетей...");
-        progressBar.setVisible(true);
-        progressBar.setIndeterminate(true);
-        refreshButton.setText("⏳ Сканирование...");
-
-        wifiScanner.scanNetworks(networks -> {
-            SwingUtilities.invokeLater(() -> {
-                listModel.clear();
-                if (networks.isEmpty()) {
-                    appendLog("❌ Wi-Fi сети не обнаружены");
-                    statusLabel.setText("Сети не найдены");
-                    showToast("Не удалось найти Wi-Fi сети", new Color(255, 59, 48));
-                } else {
-                    appendLog("✅ Обнаружено сетей: " + networks.size());
-                    statusLabel.setText("Найдено " + networks.size() + " сетей");
-                    for (String network : networks) {
-                        listModel.addElement(network);
-                    }
-                    if (!networks.isEmpty()) {
-                        ssidList.setSelectedIndex(0);
-                    }
-                }
-                setControlsEnabled(true);
-                progressBar.setVisible(false);
-                refreshButton.setText("🔄 Обновить");
-            });
-        });
-    }
-
-    private void connectToNetwork(String ssid, String password) {
-        setControlsEnabled(false);
-        statusLabel.setText("🔗 Подключение к " + ssid + "...");
-        progressBar.setVisible(true);
-        progressBar.setIndeterminate(true);
-        connectButton.setText("⏳ Подключение...");
-
-        wifiConnector.connectToNetwork(ssid, password, success -> {
-            SwingUtilities.invokeLater(() -> {
-                if (success) {
-                    appendLog("✅ Успешное подключение к " + ssid);
-                    statusLabel.setText("Подключено к " + ssid);
-                    connectionStatusLabel.setText("🟢 Подключено к " + ssid);
-                    connectionStatusLabel.setForeground(new Color(52, 199, 89));
-                    showToast("Успешное подключение к " + ssid, new Color(52, 199, 89));
-                } else {
-                    appendLog("❌ Ошибка подключения к " + ssid);
-                    statusLabel.setText("Ошибка подключения");
-                    showToast("Не удалось подключиться к " + ssid, new Color(255, 59, 48));
-                }
-                setControlsEnabled(true);
-                progressBar.setVisible(false);
-                connectButton.setText("🔗 Подключить");
-            });
-        });
-    }
-
-    private void disconnectFromNetwork() {
-        setControlsEnabled(false);
-        statusLabel.setText("🔌 Отключение от сети...");
-        progressBar.setVisible(true);
-        progressBar.setIndeterminate(true);
-
-        new Thread(() -> {
-            try {
-                Thread.sleep(2000);
-                SwingUtilities.invokeLater(() -> {
-                    appendLog("🔌 Отключено от текущей сети");
-                    statusLabel.setText("Не подключено");
-                    connectionStatusLabel.setText("🔴 Не подключено");
-                    connectionStatusLabel.setForeground(new Color(255, 59, 48));
-                    progressBar.setVisible(false);
-                    setControlsEnabled(true);
-                    showToast("Успешно отключено от сети", new Color(52, 199, 89));
-                });
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }).start();
-    }
-
-    private void startBruteForce(String ssid) {
-        boolean showPasswords = showPasswordsCheckbox.isSelected();
-        bruteForceButton.setText("⏹️ Остановить");
-        bruteForceButton.setBackground(new Color(255, 59, 48));
-        statusLabel.setText("🔓 Подбор пароля для " + ssid);
-        progressBar.setVisible(true);
-        progressBar.setIndeterminate(true);
-
-        bruteForcer.startBruteForce(ssid, showPasswords, foundPassword -> {
-            SwingUtilities.invokeLater(() -> {
-                if (foundPassword != null) {
-                    passwordField.setText(foundPassword);
-                    appendLog("🎉 Пароль успешно подобран: " + foundPassword);
-                    statusLabel.setText("Пароль найден!");
-                    progressBar.setVisible(false);
-
-                    if (autoConnectCheckbox.isSelected()) {
-                        appendLog("⚡ Автоподключение к сети...");
-                        connectToNetwork(ssid, foundPassword);
-                    } else {
-                        int result = JOptionPane.showConfirmDialog(this,
-                                "<html><b>Пароль найден!</b><br>Сеть: <b>" + ssid +
-                                        "</b><br>Пароль: <b>" + foundPassword + "</b><br><br>" +
-                                        "Подключиться к сети?</html>",
-                                "Пароль подобран",
-                                JOptionPane.YES_NO_OPTION,
-                                JOptionPane.QUESTION_MESSAGE);
-
-                        if (result == JOptionPane.YES_OPTION) {
-                            connectToNetwork(ssid, foundPassword);
-                        }
-                    }
-                } else {
-                    statusLabel.setText("Подбор завершен - пароль не найден");
-                    progressBar.setVisible(false);
-                    showToast("Пароль не найден за отведенное время", new Color(255, 149, 0));
-                }
-                bruteForceButton.setText("🔓 Подобрать пароль");
-                bruteForceButton.setBackground(new Color(151, 92, 228));
-                setControlsEnabled(true);
-            });
-        });
-    }
-
-    private void stopBruteForce() {
-        bruteForcer.stopBruteForce();
-        bruteForceButton.setText("🔓 Подобрать пароль");
-        bruteForceButton.setBackground(new Color(151, 92, 228));
-        statusLabel.setText("Подбор остановлен пользователем");
-        progressBar.setVisible(false);
-        setControlsEnabled(true);
-        appendLog("⏹️ Подбор пароля остановлен");
-    }
-
-    private void setControlsEnabled(boolean enabled) {
-        refreshButton.setEnabled(enabled);
-        connectButton.setEnabled(enabled);
-        disconnectButton.setEnabled(enabled);
-        ssidList.setEnabled(enabled);
-        passwordField.setEnabled(enabled);
-        showPasswordsCheckbox.setEnabled(enabled);
-        autoConnectCheckbox.setEnabled(enabled);
-        filterComboBox.setEnabled(enabled);
-
-        if (enabled) {
-            bruteForceButton.setEnabled(true);
-        }
-    }
-
-    private void appendLog(String message) {
+    private void log(String msg) {
         SwingUtilities.invokeLater(() -> {
-            String timestamp = java.time.LocalTime.now().format(
-                    java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss"));
-
-            if (message.contains("❌") || message.contains("Ошибка") || message.contains("остановлен")) {
-                logArea.append("[" + timestamp + "] " + message + "\n");
-            } else if (message.contains("✅") || message.contains("Успех") || message.contains("НАЙДЕН")) {
-                logArea.append("[" + timestamp + "] " + message + "\n");
-            } else if (message.contains("⚠️") || message.contains("Внимание")) {
-                logArea.append("[" + timestamp + "] " + message + "\n");
-            } else {
-                logArea.append("[" + timestamp + "] " + message + "\n");
-            }
-
+            logArea.append("[" + LocalTime.now().format(TIME_FMT) + "] " + msg + "\n");
             logArea.setCaretPosition(logArea.getDocument().getLength());
         });
     }
 
-    private Image createModernAppIcon() {
-        int size = 64;
-        BufferedImage icon = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
-        Graphics2D g2 = icon.createGraphics();
-        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-
-        GradientPaint gradient = new GradientPaint(0, 0, new Color(0, 122, 255),
-                size, size, new Color(13, 110, 253));
-        g2.setPaint(gradient);
-        g2.fillRoundRect(0, 0, size, size, 16, 16);
-
-        g2.setColor(Color.WHITE);
-        g2.setStroke(new BasicStroke(2.8f));
-        int centerX = size / 2;
-        int centerY = size / 2;
-
-        for (int i = 0; i < 4; i++) {
-            int radius = 6 + i * 6;
-            float alpha = 1.0f - (i * 0.25f);
-            g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
-            g2.drawArc(centerX - radius, centerY - radius, radius * 2, radius * 2, -50, 100);
+    private void exportLog() {
+        JFileChooser fc = new JFileChooser();
+        if (fc.showSaveDialog(this) == JFileChooser.APPROVE_OPTION) {
+            try {
+                java.nio.file.Files.writeString(fc.getSelectedFile().toPath(), logArea.getText());
+                toast("logExported", new Color(52, 199, 89));
+            } catch (Exception ex) {
+                toast("exportError", Color.RED);
+            }
         }
-
-        g2.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 1.0f));
-        g2.fillOval(centerX - 3, centerY - 3, 6, 6);
-
-        g2.dispose();
-        return icon;
     }
 
+    private void filterLogs() { /* Реализуй по аналогии */ }
+
+    private void loadPrefs() {
+        darkTheme = PREFS.getBoolean("darkTheme", true);
+        scanInterval = PREFS.getInt("scanInterval", 30);
+        autoRefreshEnabled = PREFS.getBoolean("autoRefreshEnabled", true);
+    }
+
+    @Override
+    public void dispose() {
+        PREFS.putBoolean("darkTheme", darkTheme);
+        PREFS.putInt("scanInterval", scanInterval);
+        PREFS.putBoolean("autoRefreshEnabled", autoRefreshEnabled);
+        if (autoRefresh != null) {
+            autoRefresh.cancel();
+        }
+        super.dispose();
+    }
+
+    private void applyTheme() {
+        if (darkTheme) FlatDarkLaf.setup(); else FlatLightLaf.setup();
+    }
+
+    // === UI HELPERS ===
+    private void setupCombo(JComboBox<?> c) {
+        c.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        c.setPreferredSize(new Dimension(160, 36));
+    }
+
+    private void setupCheckbox(JCheckBox c) {
+        c.setFont(new Font("Segoe UI", Font.PLAIN, 13));
+        c.setOpaque(false);
+        c.setForeground(darkTheme ? Color.WHITE : Color.BLACK);
+    }
+
+    private void stylePrimaryBtn(JButton b, Color c) {
+        b.setBackground(c);
+        b.setForeground(Color.WHITE);
+        b.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        b.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(c.darker(), 2),
+                BorderFactory.createEmptyBorder(10, 20, 10, 20)
+        ));
+        addHover(b, c, c.brighter());
+    }
+
+    private void styleSecondaryBtn(JButton b, Color c) {
+        b.setBackground(c);
+        b.setForeground(Color.WHITE);
+        b.setFont(new Font("Segoe UI", Font.BOLD, 13));
+        b.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(c.brighter()),
+                BorderFactory.createEmptyBorder(8, 16, 8, 16)
+        ));
+        addHover(b, c, c.brighter());
+    }
+
+    private void styleIconBtn(JButton b) {
+        b.setBorder(new EmptyBorder(8, 8, 8, 8));
+        b.setBackground(new Color(73, 73, 74));
+        b.setForeground(Color.WHITE);
+        addHover(b, new Color(73, 73, 74), new Color(99, 99, 102));
+    }
+
+    private void addHover(JButton b, Color from, Color to) {
+        Timeline t = Timeline.builder(b)
+                .addPropertyToInterpolate("background", from, to)
+                .setDuration(200).build();
+        b.addMouseListener(new MouseAdapter() {
+            public void mouseEntered(MouseEvent e) { t.play(); }
+            public void mouseExited(MouseEvent e) { t.playReverse(); }
+        });
+    }
+
+    private Image createIcon() {
+        int s = 64;
+        BufferedImage img = new BufferedImage(s, s, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = img.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        GradientPaint gp = new GradientPaint(0, 0, new Color(0, 122, 255), s, s, new Color(13, 110, 253));
+        g.setPaint(gp);
+        g.fillRoundRect(0, 0, s, s, 16, 16);
+        g.setColor(Color.WHITE);
+        g.setStroke(new BasicStroke(3));
+        int cx = s/2, cy = s/2;
+        for (int i = 0; i < 4; i++) {
+            int r = 8 + i*7;
+            float a = 1f - i*0.25f;
+            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, a));
+            g.drawArc(cx-r, cy-r, r*2, r*2, -45, 90);
+        }
+        g.setComposite(AlphaComposite.SrcOver);
+        g.fillOval(cx-4, cy-4, 8, 8);
+        g.dispose();
+        return img;
+    }
+
+    private BufferedImage createIcon(int size, String emoji) {
+        BufferedImage img = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = img.createGraphics();
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setFont(new Font("Segoe UI Emoji", Font.PLAIN, size));
+        g.setColor(Color.WHITE);
+        FontMetrics fm = g.getFontMetrics();
+        int x = (size - fm.stringWidth(emoji)) / 2;
+        int y = (size - fm.getHeight()) / 2 + fm.getAscent();
+        g.drawString(emoji, x, y);
+        g.dispose();
+        return img;
+    }
+
+    // === RENDERERS ===
+    static class NetworkRenderer extends JPanel implements ListCellRenderer<WifiNetwork> {
+        private JLabel ssid = new JLabel();
+        private JLabel info = new JLabel();
+        private JLabel signal = new JLabel();
+
+        public NetworkRenderer() {
+            setLayout(new MigLayout("fill, insets 10", "[grow]10[]", "[]"));
+            setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(new Color(60, 60, 60)),
+                    BorderFactory.createEmptyBorder(8, 12, 8, 12)
+            ));
+            ssid.setFont(new Font("Segoe UI", Font.BOLD, 15));
+            info.setFont(new Font("Segoe UI", Font.PLAIN, 12));
+            info.setForeground(new Color(173, 181, 189));
+            signal.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 20));
+            add(ssid, "grow");
+            add(signal);
+            add(info, "wrap, span");
+        }
+
+        @Override
+        public Component getListCellRendererComponent(JList<? extends WifiNetwork> list, WifiNetwork net,
+                                                      int index, boolean selected, boolean focus) {
+            ssid.setText(net.getSsid());
+            String sec = net.getSecurity().equals("Open") ? "openNetwork" : "secured";
+            info.setText(BUNDLE.getString(sec) + " • " + net.getFrequency());
+            signal.setText(switch (net.getSignalStrength() / 20) {
+                case 5 -> "fullSignal";
+                case 4 -> "goodSignal";
+                case 3 -> "averageSignal";
+                case 2 -> "weakSignal";
+                default -> "veryWeakSignal";
+            });
+            setBackground(selected ? new Color(0, 122, 255) : (index % 2 == 0 ? new Color(28, 28, 28) : new Color(24, 24, 24)));
+            ssid.setForeground(selected ? Color.WHITE : Color.WHITE);
+            info.setForeground(selected ? Color.WHITE : new Color(173, 181, 189));
+            return this;
+        }
+    }
+
+    // === CUSTOM COMPONENTS ===
+    static class ModernCardPanel extends JPanel {
+        public ModernCardPanel() {
+            setOpaque(false);
+            setBorder(BorderFactory.createCompoundBorder(
+                    BorderFactory.createLineBorder(new Color(50, 50, 50)),
+                    BorderFactory.createEmptyBorder(15, 15, 15, 15)
+            ));
+        }
+        protected void paintComponent(Graphics g) {
+            super.paintComponent(g);
+            Graphics2D g2 = (Graphics2D) g.create();
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            g2.setColor(getBackground());
+            g2.fillRoundRect(0, 0, getWidth(), getHeight(), 16, 16);
+            g2.dispose();
+        }
+    }
+
+    static class ModernSectionLabel extends JLabel {
+        public ModernSectionLabel(String key) {
+            super(BUNDLE.getString(key));
+            setFont(new Font("Segoe UI", Font.BOLD, 16));
+            setForeground(new Color(0, 122, 255));
+        }
+    }
+
+    static class ModernFieldLabel extends JLabel {
+        public ModernFieldLabel(String key) {
+            super(BUNDLE.getString(key));
+            setFont(new Font("Segoe UI", Font.PLAIN, 13));
+            setForeground(new Color(173, 181, 189));
+        }
+    }
+
+    static class ModernScrollPane extends JScrollPane {
+        public ModernScrollPane(Component c) {
+            super(c);
+            setBorder(BorderFactory.createEmptyBorder());
+            getVerticalScrollBar().setUnitIncrement(16);
+        }
+    }
+
+    static class ModernProgressBar extends JProgressBar {
+        public ModernProgressBar() {
+            setStringPainted(true);
+            setFont(new Font("Segoe UI", Font.BOLD, 12));
+        }
+    }
+
+    // === MAIN ===
     public static void main(String[] args) {
         SwingUtilities.invokeLater(() -> {
             try {
-                FlatDarkLaf.setup();
-
                 UIManager.put("Button.arc", 12);
                 UIManager.put("Component.arc", 12);
                 UIManager.put("TextComponent.arc", 8);
-                UIManager.put("ScrollBar.width", 16);
-
-                new WifiConnectorGuiList().setVisible(true);
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
+                new WifiConnectorGuiList();
+            } catch (Exception e) { e.printStackTrace(); }
         });
-    }
-}
-
-class ModernCardPanel extends JPanel {
-    public ModernCardPanel() {
-        setOpaque(false);
-    }
-
-    @Override
-    protected void paintComponent(Graphics g) {
-        Graphics2D g2 = (Graphics2D) g.create();
-        g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
-
-        g2.setColor(getBackground());
-        g2.fillRoundRect(0, 0, getWidth(), getHeight(), 20, 20);
-
-        g2.setColor(UIManager.getColor("Component.borderColor"));
-        g2.drawRoundRect(0, 0, getWidth()-1, getHeight()-1, 20, 20);
-
-        g2.dispose();
-    }
-}
-
-class ModernScrollPane extends JScrollPane {
-    public ModernScrollPane(Component view) {
-        super(view);
-        setBorder(BorderFactory.createEmptyBorder());
-        setOpaque(false);
-        getViewport().setOpaque(false);
-    }
-}
-
-class ModernProgressBar extends JProgressBar {
-    public ModernProgressBar() {
-        setOpaque(false);
-        setBorder(BorderFactory.createEmptyBorder(2, 2, 2, 2));
-    }
-}
-//
-class ModernSectionLabel extends JLabel {
-    public ModernSectionLabel(String text) {
-        super(text);
-        setFont(new Font("Segoe UI", Font.BOLD, 18));
-    }
-}
-
-class ModernFieldLabel extends JLabel {
-    public ModernFieldLabel(String text) {
-        super(text);
-        setFont(new Font("Segoe UI", Font.BOLD, 14));
-    }
-}
-
-class ModernNetworkListRenderer extends JPanel implements ListCellRenderer<String> {
-    private JLabel nameLabel = new JLabel();
-    private JLabel signalLabel = new JLabel();
-    private JLabel securityLabel = new JLabel();
-
-    public ModernNetworkListRenderer() {
-        setLayout(new MigLayout("fill, insets 12", "[grow]", "[]0[]"));
-        setOpaque(true);
-
-        nameLabel.setFont(new Font("Segoe UI", Font.BOLD, 14));
-        signalLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
-        securityLabel.setFont(new Font("Segoe UI", Font.PLAIN, 11));
-
-        JPanel detailsPanel = new JPanel(new MigLayout("insets 0, gapx 8", "[][right]", "[]"));
-        detailsPanel.setOpaque(false);
-        detailsPanel.add(signalLabel);
-        detailsPanel.add(securityLabel, "push");
-
-        add(nameLabel, "wrap");
-        add(detailsPanel, "grow");
-    }
-
-    @Override
-    public Component getListCellRendererComponent(JList<? extends String> list, String value,
-                                                  int index, boolean isSelected, boolean cellHasFocus) {
-        nameLabel.setText(value);
-
-        int signalStrength = (int)(Math.random() * 5) + 1;
-        boolean isSecure = Math.random() > 0.3;
-
-        signalLabel.setText("📶 " + getSignalText(signalStrength));
-        signalLabel.setForeground(getSignalColor(signalStrength));
-        securityLabel.setText(isSecure ? "🔒 WPA2" : "🔓 Открытая");
-        securityLabel.setForeground(isSecure ? new Color(52, 199, 89) : new Color(255, 149, 0));
-
-        if (isSelected) {
-            setBackground(new Color(0, 122, 255));
-            nameLabel.setForeground(Color.WHITE);
-            signalLabel.setForeground(Color.WHITE);
-            securityLabel.setForeground(Color.WHITE);
-        } else {
-            setBackground(index % 2 == 0 ?
-                    UIManager.getColor("Table.background") :
-                    UIManager.getColor("Table.alternateRowColor"));
-            nameLabel.setForeground(UIManager.getColor("Label.foreground"));
-        }
-
-        return this;
-    }
-
-    private String getSignalText(int strength) {
-        return switch (strength) {
-            case 5 -> "Отличный";
-            case 4 -> "Хороший";
-            case 3 -> "Средний";
-            case 2 -> "Слабый";
-            default -> "Очень слабый";
-        };
-    }
-
-    private Color getSignalColor(int strength) {
-        return switch (strength) {
-            case 5 -> new Color(52, 199, 89);
-            case 4 -> new Color(48, 176, 199);
-            case 3 -> new Color(255, 149, 0);
-            case 2 -> new Color(255, 59, 48);
-            default -> new Color(142, 142, 147);
-        };
     }
 }
